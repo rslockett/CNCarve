@@ -8,7 +8,12 @@ import type {
   StockOnBed,
   WizardAnswers,
 } from "@/lib/presets/types";
-import { readNativeStlSize } from "@/lib/stockTransform";
+import {
+  nativeMeshExceedsStock,
+  patternFootprintOnStockTopMm,
+  patternThicknessHeuristicMm,
+  readNativeStlSize,
+} from "@/lib/stockTransform";
 import { lengthFromDisplay, lengthToDisplay } from "@/lib/units";
 import {
   coerceToolsForMachine,
@@ -28,110 +33,7 @@ import {
   useState,
 } from "react";
 import { createPortal } from "react-dom";
-
-/** Top-view diagram: stock, usable area (margin), and pattern XY footprint. */
-function StockStlFitPreview({
-  stockWidthMm,
-  stockDepthMm,
-  marginMm,
-  patternXMm,
-  patternYMm,
-}: {
-  stockWidthMm: number;
-  stockDepthMm: number;
-  marginMm: number;
-  patternXMm: number;
-  patternYMm: number;
-}) {
-  const k = useMemo(() => {
-    const maxSide = Math.max(stockWidthMm, stockDepthMm, 1);
-    return 88 / maxSide;
-  }, [stockWidthMm, stockDepthMm]);
-
-  const sw = stockWidthMm * k;
-  const sd = stockDepthMm * k;
-  const vbW = 100;
-  const vbH = Math.max(56, sd + 12);
-  const ox = (vbW - sw) / 2;
-  const oy = (vbH - sd) / 2;
-
-  const inset = Math.min(marginMm * k, sw / 2 - 0.5, sd / 2 - 0.5);
-  const usableW = Math.max(0, sw - 2 * inset);
-  const usableH = Math.max(0, sd - 2 * inset);
-  const ux = ox + inset;
-  const uy = oy + inset;
-
-  const pw = patternXMm * k;
-  const ph = patternYMm * k;
-  const px = ox + (sw - pw) / 2;
-  const py = oy + (sd - ph) / 2;
-
-  const fitsX = patternXMm <= stockWidthMm - 2 * marginMm + 1e-6;
-  const fitsY = patternYMm <= stockDepthMm - 2 * marginMm + 1e-6;
-  const fits = fitsX && fitsY;
-
-  return (
-    <figure className="mt-3 overflow-hidden rounded-xl border border-white/10 bg-slate-950/60">
-      <svg
-        viewBox={`0 0 ${vbW} ${vbH}`}
-        className="h-auto w-full text-slate-200"
-        aria-hidden
-      >
-        <rect
-          x={ox}
-          y={oy}
-          width={sw}
-          height={sd}
-          rx={1.2}
-          className="fill-amber-900/35 stroke-amber-600/50"
-          strokeWidth={0.6}
-        />
-        <rect
-          x={ux}
-          y={uy}
-          width={usableW}
-          height={usableH}
-          rx={0.8}
-          fill="none"
-          className="stroke-slate-500/60"
-          strokeWidth={0.45}
-          strokeDasharray="2 2"
-        />
-        <rect
-          x={px}
-          y={py}
-          width={pw}
-          height={ph}
-          rx={0.6}
-          className={
-            fits
-              ? "fill-teal-500/25 stroke-teal-400/80"
-              : "fill-rose-500/20 stroke-rose-400/90"
-          }
-          strokeWidth={0.55}
-        />
-        <text
-          x={vbW / 2}
-          y={oy + sd + 7}
-          textAnchor="middle"
-          style={{
-            fill: "rgba(148, 163, 184, 0.95)",
-            fontSize: "4.2px",
-            fontWeight: 500,
-          }}
-        >
-          Top view — stock (tan), margin (dashed), pattern (teal)
-        </text>
-      </svg>
-      {!fits && (
-        <figcaption className="border-t border-rose-500/20 bg-rose-950/25 px-3 py-2 text-xs text-rose-200/90">
-          Pattern is wider or deeper than the usable area inside your margin — use
-          Auto-fit or shrink the size.
-        </figcaption>
-      )}
-    </figure>
-  );
-}
+import { StockMeshTopPreview } from "./StockMeshTopPreview";
 
 const PLACEMENTS: { id: PatternPlacement; label: string; hint: string }[] = [
   { id: "center", label: "Center", hint: "Most people start here." },
@@ -183,6 +85,7 @@ export function SetupWizard({
     setStlBuffer,
     setStlNativeSize,
     stlNativeSize,
+    stlBuffer,
   } = useAppState();
 
   const materials = listMaterials();
@@ -192,6 +95,10 @@ export function SetupWizard({
   );
   const qualities = listQuality();
   const safety = validateSafety(answers);
+  const patternBedFootprint = useMemo(
+    () => patternFootprintOnStockTopMm(answers.patternSizeMm),
+    [answers.patternSizeMm.x, answers.patternSizeMm.y, answers.patternSizeMm.z],
+  );
   const u = answers.displayUnits;
   const dimSuffix = u === "mm" ? "mm" : "in";
   const formatDisplay = useCallback(
@@ -227,16 +134,6 @@ export function SetupWizard({
     formatDisplay,
   ]);
 
-  const syncPatternFromNative = useCallback(
-    (native: { x: number; y: number; z: number }) => {
-      setAnswers((a) => ({
-        ...a,
-        patternSizeMm: { x: native.x, y: native.y, z: native.z },
-      }));
-    },
-    [setAnswers],
-  );
-
   const onStlPicked = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
     if (!f) {
@@ -251,12 +148,28 @@ export function SetupWizard({
       return;
     }
     setStlFile(f);
-    setAnswers((a) => ({ ...a, stlFileName: f.name }));
     const buf = await f.arrayBuffer();
     setStlBuffer(buf);
     const nat = readNativeStlSize(buf);
     setStlNativeSize(nat);
-    if (nat) syncPatternFromNative(nat);
+    setAnswers((a) => {
+      const next = { ...a, stlFileName: f.name };
+      if (!nat) {
+        return { ...next, patternSizeMm: { x: 0, y: 0, z: 0 } };
+      }
+      if (
+        !nativeMeshExceedsStock(
+          nat,
+          a.stockWidthMm,
+          a.stockDepthMm,
+          a.stockThicknessMm,
+          a.stockMarginMm,
+        )
+      ) {
+        return { ...next, patternSizeMm: { x: nat.x, y: nat.y, z: nat.z } };
+      }
+      return { ...next, patternSizeMm: { x: 0, y: 0, z: 0 } };
+    });
   };
 
   const setPatternField = useCallback(
@@ -309,44 +222,65 @@ export function SetupWizard({
   );
 
   const autoFitPatternToStock = useCallback(() => {
-    setAnswers((a) => {
-      const nat = stlNativeSize;
-      if (!nat) return a;
+    const nat = stlNativeSize;
+    if (!nat) return;
 
-      // Use live draft text so Auto-fit reflects what user just typed,
-      // even before blur/Enter commits those fields.
-      const draftW = lengthFromDisplay(parseFloat(stockDraft.stockWidthMm), u);
-      const draftD = lengthFromDisplay(parseFloat(stockDraft.stockDepthMm), u);
-      const draftT = lengthFromDisplay(parseFloat(stockDraft.stockThicknessMm), u);
-      const draftM = lengthFromDisplay(parseFloat(marginDraft), u);
+    const draftW = lengthFromDisplay(parseFloat(stockDraft.stockWidthMm), u);
+    const draftD = lengthFromDisplay(parseFloat(stockDraft.stockDepthMm), u);
+    const draftT = lengthFromDisplay(parseFloat(stockDraft.stockThicknessMm), u);
+    const draftM = lengthFromDisplay(parseFloat(marginDraft), u);
 
-      const widthMm = Number.isFinite(draftW) ? Math.max(0.5, draftW) : a.stockWidthMm;
-      const depthMm = Number.isFinite(draftD) ? Math.max(0.5, draftD) : a.stockDepthMm;
-      const thickMm = Number.isFinite(draftT) ? Math.max(0.5, draftT) : a.stockThicknessMm;
-      const marginMm = Number.isFinite(draftM) ? Math.max(0, draftM) : a.stockMarginMm;
+    const widthMm = Number.isFinite(draftW) ? Math.max(0.5, draftW) : answers.stockWidthMm;
+    const depthMm = Number.isFinite(draftD) ? Math.max(0.5, draftD) : answers.stockDepthMm;
+    const thickMm = Number.isFinite(draftT) ? Math.max(0.5, draftT) : answers.stockThicknessMm;
+    const marginMm = Number.isFinite(draftM) ? Math.max(0, draftM) : answers.stockMarginMm;
 
-      const usableW = Math.max(1, widthMm - 2 * marginMm);
-      const usableD = Math.max(1, depthMm - 2 * marginMm);
-      const usableZ = Math.max(0.5, thickMm - marginMm);
-      // Auto-fit is a top-view action: fill the usable XY area first.
-      // Z may exceed stock thickness for very tall meshes; we surface that as safety text.
-      const s = Math.min(usableW / nat.x, usableD / nat.y);
-      return {
-        ...a,
-        stockWidthMm: widthMm,
-        stockDepthMm: depthMm,
-        stockThicknessMm: thickMm,
-        stockMarginMm: marginMm,
-        linkPatternSizes: true,
-        patternScaleAxis: "uniform",
-        patternSizeMm: {
-          x: nat.x * s,
-          y: nat.y * s,
-          z: nat.z * s,
-        },
-      };
+    const usableW = Math.max(1, widthMm - 2 * marginMm);
+    const usableD = Math.max(1, depthMm - 2 * marginMm);
+    const usableZ = Math.max(0.5, thickMm - marginMm);
+    const fp = patternFootprintOnStockTopMm(nat);
+    const thick = patternThicknessHeuristicMm(nat);
+    const s = Math.min(
+      usableW / fp.widthMm,
+      usableD / fp.depthMm,
+      usableZ / thick,
+    );
+
+    setAnswers((a) => ({
+      ...a,
+      stockWidthMm: widthMm,
+      stockDepthMm: depthMm,
+      stockThicknessMm: thickMm,
+      stockMarginMm: marginMm,
+      linkPatternSizes: true,
+      patternScaleAxis: "uniform",
+      patternSizeMm: {
+        x: nat.x * s,
+        y: nat.y * s,
+        z: nat.z * s,
+      },
+    }));
+
+    setStockDraft({
+      stockWidthMm: formatDisplay(widthMm),
+      stockDepthMm: formatDisplay(depthMm),
+      stockThicknessMm: formatDisplay(thickMm),
     });
-  }, [marginDraft, setAnswers, stockDraft.stockDepthMm, stockDraft.stockThicknessMm, stockDraft.stockWidthMm, stlNativeSize, u]);
+    setMarginDraft(formatDisplay(marginMm));
+  }, [
+    answers.stockDepthMm,
+    answers.stockMarginMm,
+    answers.stockThicknessMm,
+    answers.stockWidthMm,
+    formatDisplay,
+    marginDraft,
+    setAnswers,
+    stockDraft.stockDepthMm,
+    stockDraft.stockThicknessMm,
+    stockDraft.stockWidthMm,
+    stlNativeSize,
+    u,
+  ]);
 
   const commitStockField = useCallback(
     (key: "stockWidthMm" | "stockDepthMm" | "stockThicknessMm", raw: string) => {
@@ -412,7 +346,16 @@ export function SetupWizard({
   const importBlockedReason = !committedForImport.stlFileName
     ? "Upload an STL above — the Import button stays off until a file is chosen."
     : !isPatternSizeReady(committedForImport)
-      ? "Carved size is still zero. Use a binary STL so dimensions auto-fill, or turn off “Lock proportions” and type X, Y, and Z."
+      ? stlNativeSize &&
+        nativeMeshExceedsStock(
+          stlNativeSize,
+          committedForImport.stockWidthMm,
+          committedForImport.stockDepthMm,
+          committedForImport.stockThicknessMm,
+          committedForImport.stockMarginMm,
+        )
+        ? "Mesh is larger than your stock (inside the margin) at full file size — tap Auto-fit on stock or set Carve X/Y/Z."
+        : "Carved size is still zero. Use a binary STL so dimensions auto-fill, or turn off “Lock proportions” and type X, Y, and Z."
       : null;
 
   const patternCarveInputsDisabled =
@@ -662,17 +605,34 @@ export function SetupWizard({
                   : "could not read — use a binary STL"}
               </p>
             )}
-            <StockStlFitPreview
-              stockWidthMm={answers.stockWidthMm}
-              stockDepthMm={answers.stockDepthMm}
-              marginMm={answers.stockMarginMm}
-              patternXMm={answers.patternSizeMm.x}
-              patternYMm={answers.patternSizeMm.y}
+            <StockMeshTopPreview
+              answers={answers}
+              stlBuffer={stlBuffer}
+              patternFootprintWidthMm={patternBedFootprint.widthMm}
+              patternFootprintDepthMm={patternBedFootprint.depthMm}
             />
+            <label className="mt-3 flex cursor-pointer items-center gap-2 text-sm text-slate-300">
+              <input
+                type="checkbox"
+                checked={answers.patternTopViewMirrorY}
+                onChange={(e) =>
+                  setAnswers((a) => ({ ...a, patternTopViewMirrorY: e.target.checked }))
+                }
+                className="rounded border-white/20 bg-slate-900 text-teal-500"
+              />
+              <span>
+                Mirror pattern on Y in this preview only — matches many CAD exports to the diagram
+                without changing the STL sent to Kiri. Turn off if the modal and Kiri already agree.
+              </span>
+            </label>
             <button
               type="button"
               disabled={!stlNativeSize}
-              onClick={autoFitPatternToStock}
+              onClick={(ev) => {
+                ev.preventDefault();
+                ev.stopPropagation();
+                autoFitPatternToStock();
+              }}
               className="mt-3 w-full rounded-xl border border-teal-500/40 bg-teal-950/40 px-4 py-2.5 text-sm font-medium text-teal-100 hover:bg-teal-900/50 disabled:cursor-not-allowed disabled:opacity-40"
             >
               Auto-fit on stock
@@ -719,9 +679,8 @@ export function SetupWizard({
           <section>
             <h3 className="text-sm font-semibold text-white">Machine & cutters</h3>
             <p className="mt-1 text-xs text-slate-500">
-              Material drives safe feeds; the wizard writes Kiri milling ops (Contour
-              surface slices for relief, Rough only when using two-step strategy) plus
-              stock.
+              Material drives safe feeds. With the recommended one-bit flow, Kiri gets outline +
+              contour only; a roughing pass is added only if you choose the two-bit advanced strategy.
             </p>
             <select
               className="mt-3 w-full rounded-xl border border-white/10 bg-slate-950/80 px-3 py-2.5 text-sm text-slate-100 outline-none focus:border-teal-500/50"
@@ -766,15 +725,11 @@ export function SetupWizard({
             </div>
             <fieldset className="mt-4 space-y-3 border-none p-0">
               <legend className="sr-only">Cutting strategy</legend>
-              <p className="text-xs text-slate-500">
-                One-bit imports as <strong className="font-medium text-slate-400">Outline</strong>
-                {" "}
-                then <strong className="font-medium text-slate-400">Contour</strong> with the same
-                tool. Contour uses <strong className="font-medium text-slate-400">Inside only</strong>{" "}
-                and leaves <strong className="font-medium text-slate-400">Clip to stock</strong> off
-                so Kiri does not “or” the big board rectangle with your silhouette (which would
-                clear the whole stock). Quality here maps to Precision, Flatness, Reduction, and
-                Step over in Kiri.
+              <p className="text-xs leading-relaxed text-slate-500">
+                <strong className="font-medium text-slate-400">Recommended for hobbyists:</strong>{" "}
+                keep one V-bit in the collet for the whole job. CNCarve builds an outline pass
+                around the silhouette, then contour passes for the relief — no bit change, so Z
+                and XY stay consistent.
               </p>
               <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
                 <label className="flex cursor-pointer items-center gap-2 text-sm text-slate-300">
@@ -790,7 +745,7 @@ export function SetupWizard({
                       }))
                     }
                   />
-                  One bit → Outline + Contour (same cutter)
+                  One bit — outline + contour (no tool change)
                 </label>
                 <label className="flex cursor-pointer items-center gap-2 text-sm text-slate-300">
                   <input
@@ -805,7 +760,7 @@ export function SetupWizard({
                       }))
                     }
                   />
-                  Rough bulk clear + contour finish (tool per phase)
+                  Advanced — flat rougher, then V finish (tool change; reset Z carefully)
                 </label>
               </div>
               {answers.camToolStrategy === "single" ? (
@@ -872,7 +827,7 @@ export function SetupWizard({
               )}
             </fieldset>
             <label className="mt-3 block text-xs text-slate-400">
-              Quality vs speed (step-over, chord tolerance & flatness in Kiri)
+              Look and carve time (CNCarve picks the technical settings)
               <select
                 className="mt-1 w-full rounded-xl border border-white/10 bg-slate-950/80 px-3 py-2 text-sm text-slate-100"
                 value={answers.qualityId}
@@ -890,18 +845,26 @@ export function SetupWizard({
                 ))}
               </select>
             </label>
-            <p className="mt-2 text-xs text-slate-500">
-              <strong className="font-medium text-slate-400">How this maps into Kiri:</strong>{" "}
-              Precision ≈ chord tolerance (smaller = closer mesh follow). Flatness ≈ surfacing
-              fidelity. Reduction = mesh simplify steps before contour (0 = keep most detail).
-              Step over scales pass spacing × tool ø. Outline Z-step also tightens toward{" "}
-              <span className="text-slate-400">Replica</span>.
+            <p className="mt-2 text-xs leading-relaxed text-slate-500">
+              Start on <span className="text-slate-400">Balanced</span>; use{" "}
+              <span className="text-slate-400">Sharper</span> if you still see ridges, or{" "}
+              <span className="text-slate-400">Quick</span> when you need speed.
             </p>
-            <p className="mt-1 text-xs text-slate-500">
-              For engraved reliefs, prefer <span className="text-slate-400">Fine</span> or{" "}
-              <span className="text-slate-400">Replica</span> — Replica is much slower but drives
-              the numbers above toward a tighter STL match.
-            </p>
+            <details className="mt-2 text-xs text-slate-500">
+              <summary className="cursor-pointer text-slate-400 hover:text-slate-300">
+                Technical: what CNCarve sends to Kiri
+              </summary>
+              <p className="mt-2 leading-relaxed">
+                Each tier sets contour spacing (scallop proxy), slice tolerance, flatness, mesh
+                reduction, and outline step-over. Small patterns get a modest scallop relaxation so
+                Sharper does not over-pass on jewelry-sized work. One-bit mode keeps contour{" "}
+                <strong className="font-medium text-slate-400">Inside only</strong> with{" "}
+                <strong className="font-medium text-slate-400">Clip to stock</strong> off so the
+                stock rectangle does not merge with your silhouette. The embedded Kiri:Moto
+                (grid.space) honors the outline <code className="text-slate-400">expand</code> we
+                send for V-bit cone clearance — no local build required.
+              </p>
+            </details>
           </section>
 
           <section>

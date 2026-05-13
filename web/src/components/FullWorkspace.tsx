@@ -2,12 +2,13 @@
 
 import { useAppState } from "@/context/AppState";
 import {
+  getKiriUrl,
   importIntoKiri,
   invalidatePendingKiriImports,
   isKiriDebugEnabled,
   isKiriIframeReady,
+  kiriPostMessageTargetOrigin,
   KIRI_ORIGIN,
-  KIRI_URL,
   registerKiriFrameCallbacks,
   requestKiriCancel,
   requestKiriExport,
@@ -17,9 +18,11 @@ import {
 } from "@/lib/kiriBridge";
 import { isWebGlLikelyAvailable } from "@/lib/webglCheck";
 import { buildStlForKiri } from "@/lib/stockTransform";
+import { chooseSingleBitContourAxis } from "@/lib/contourAxisChoice";
 import type { WizardAnswers } from "@/lib/presets/types";
 import { isPatternSizeReady, mapWizardToKiri } from "@/lib/wizard";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { MachinePopout } from "./MachinePopout";
 import { SendToMachineWizard } from "./SendToMachineWizard";
 import { SetupWizard } from "./SetupWizard";
 
@@ -37,9 +40,6 @@ const KIRI_SLICE_DONE = new Set([
   "print",
 ]);
 const KIRI_PREPARE_DONE = new Set(["prepare.done", "prepare.end"]);
-
-const KIRI_DEBUG_TOAST_HINT =
-  ' Logs: F12 → Console → localStorage.setItem("cnkiri.debug","1") → reload → Import again (watch for lines tagged [Kiri → CNCarve] and [CNCarve → Kiri]).';
 
 /** Total wait cap; export-first path usually finishes in 1–3 min when Preview already ran in Kiri. */
 const KIRI_SYNC_MAX_WAIT_MS = 20 * 60 * 1000;
@@ -61,6 +61,31 @@ function formatSyncElapsed(totalSec: number): string {
   return `${sec}s`;
 }
 
+/**
+ * Kiri’s left column (tabs / stock / limits / …) sits in the iframe; we can’t read its width
+ * cross-origin, so we reserve a conservative strip and place the companion to the right of it.
+ * Must stay in sync with the companion shell `max-w-[26rem]` for horizontal clamping.
+ */
+const KIRI_LEFT_STACK_RESERVE_PX = 252;
+const GCODE_COMPANION_GAP_PX = 10;
+/** Kiri’s `#mid` starts at ~45px; Arrange / Slice / … sit in the first rows — start the companion below that chrome. */
+const GCODE_COMPANION_TOP_PX = 124;
+const GCODE_COMPANION_MAX_WIDTH_PX = 26 * 16;
+
+function defaultGcodeCompanionX(): number {
+  if (typeof window === "undefined") {
+    return KIRI_LEFT_STACK_RESERVE_PX + GCODE_COMPANION_GAP_PX;
+  }
+  const panelW = Math.min(window.innerWidth * 0.94, GCODE_COMPANION_MAX_WIDTH_PX);
+  const preferred = KIRI_LEFT_STACK_RESERVE_PX + GCODE_COMPANION_GAP_PX;
+  const maxLeft = Math.max(8, window.innerWidth - panelW - 8);
+  return Math.min(preferred, maxLeft);
+}
+
+function getDefaultGcodeCompanionPos(): { x: number; y: number } {
+  return { x: defaultGcodeCompanionX(), y: GCODE_COMPANION_TOP_PX };
+}
+
 export function FullWorkspace() {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const importWatchdogRef = useRef<number | null>(null);
@@ -68,10 +93,20 @@ export function FullWorkspace() {
   const [dock, setDock] = useState<null | "send">(null);
   const [importStatus, setImportStatus] = useState<string | null>(null);
   const [importBusy, setImportBusy] = useState(false);
+  /**
+   * Most recent widget count reported by Kiri (via `{get:"widgets"}`). Used to detect the
+   * silent-fail mode where Kiri's iframe loads but the STL never arrives — animate then plays
+   * a stale/empty toolpath and the user sees "stock visible, bit moves, nothing carves".
+   * `null` until Kiri replies at least once.
+   */
+  const [kiriWidgetCount, setKiriWidgetCount] = useState<number | null>(null);
+  const kiriWidgetCountRef = useRef<number | null>(null);
+  kiriWidgetCountRef.current = kiriWidgetCount;
   const [kiriFrameLoaded, setKiriFrameLoaded] = useState(false);
   /** Remount iframe to recover from WebGL context loss (Kiri needs WebGL; without it postMessage import breaks internally). */
   const [kiriIframeKey, setKiriIframeKey] = useState(0);
-  const [machinePanelPos, setMachinePanelPos] = useState({ x: 24, y: 72 });
+  const [companionPhase, setCompanionPhase] = useState<"gcode" | "machine">("gcode");
+  const [gcodePanelPos, setGcodePanelPos] = useState(() => getDefaultGcodeCompanionPos());
   const dragRef = useRef<{ id: number; dx: number; dy: number } | null>(null);
 
   const { answers, stlBuffer, setExportedGcode, exportedGcode } = useAppState();
@@ -170,7 +205,9 @@ export function FullWorkspace() {
     function onMsg(ev: MessageEvent) {
       const fromKiriFrame = iframeRef.current?.contentWindow === ev.source;
       const fromKiriOrigin =
-        ev.origin === KIRI_ORIGIN || ev.origin === "https://www.grid.space";
+        ev.origin === kiriPostMessageTargetOrigin() ||
+        ev.origin === KIRI_ORIGIN ||
+        ev.origin === "https://www.grid.space";
       if (!fromKiriFrame && !fromKiriOrigin) return;
       if (fromKiriOrigin) setKiriFrameLoaded(true);
       const debug = isKiriDebugEnabled();
@@ -198,9 +235,19 @@ export function FullWorkspace() {
       const d = raw as Record<string, unknown>;
       if (Array.isArray(d.widgets)) {
         const count = d.widgets.length;
+        /**
+         * Update the **ref** synchronously here. React state batching delays `setKiriWidgetCount`
+         * by at least one render — which can land AFTER the 15s import watchdog reads the ref —
+         * producing a false "Kiri did not load the STL" banner even though the model is sitting
+         * right there in the platform (exact symptom from the latest screenshot).
+         */
+        kiriWidgetCountRef.current = count;
+        setKiriWidgetCount(count);
         if (count > 0) {
           setImportBusy(false);
-          setImportStatus("Model loaded in Kiri — widget list confirms the import.");
+          setImportStatus(
+            `Model loaded in Kiri (${count} mesh${count === 1 ? "" : "es"}). Click PREVIEW in Kiri's top bar to see the carve, then ANIMATE.`,
+          );
           if (debug) {
             console.info("[CNCarve] Kiri widget check confirmed import.", {
               count,
@@ -228,7 +275,17 @@ export function FullWorkspace() {
         const evName = (typeof d.event === "string" ? d.event : topEvent) as string;
         if (KIRI_MESH_IMPORT_EVENTS.has(evName)) {
           setImportBusy(false);
-          setImportStatus("Model loaded in Kiri — you should see it on the platform.");
+          setImportStatus(null);
+          /**
+           * `parsed`/`loaded` is the canonical "STL is on the platform" signal Kiri sends right
+           * after `data.parse` / `data.load` succeeds. Treat that as proof of at least one
+           * widget so the 15s watchdog never fires a false "did not load" banner just because
+           * the explicit `{get:'widgets'}` reply hasn't landed yet. (Sync ref + state both.)
+           */
+          if (kiriWidgetCountRef.current === null || kiriWidgetCountRef.current < 1) {
+            kiriWidgetCountRef.current = 1;
+            setKiriWidgetCount((prev) => (prev != null && prev >= 1 ? prev : 1));
+          }
           if (debug) {
             console.info(`[CNCarve] Kiri mesh import confirmed (${evName}).`, d.data);
           }
@@ -293,6 +350,7 @@ export function FullWorkspace() {
             setExportedGcode(gcode);
             setGcodeFetchStatus("ready");
             setImportStatus("G-code ready — continue in Send to machine.");
+            setCompanionPhase("gcode");
             setDock("send");
           } else {
             setGcodeFetchStatus("error");
@@ -524,7 +582,7 @@ export function FullWorkspace() {
   useEffect(() => {
     const onMove = (ev: PointerEvent) => {
       if (!dragRef.current || dragRef.current.id !== ev.pointerId) return;
-      setMachinePanelPos({
+      setGcodePanelPos({
         x: Math.max(8, ev.clientX - dragRef.current.dx),
         y: Math.max(8, ev.clientY - dragRef.current.dy),
       });
@@ -572,6 +630,8 @@ export function FullWorkspace() {
     setGcodeFetchStatus((s) => (s === "loading" ? "idle" : s));
     setImportBusy(false);
     setWizardOpen(false);
+    setCompanionPhase("gcode");
+    setGcodePanelPos(getDefaultGcodeCompanionPos());
     setDock("send");
   }, [clearGcodeFetchTimeout]);
 
@@ -584,10 +644,9 @@ export function FullWorkspace() {
     setGcodeFetchStatus((s) => (s === "loading" ? "idle" : s));
     setImportBusy(false);
     setWizardOpen(false);
+    setCompanionPhase("gcode");
+    setGcodePanelPos(getDefaultGcodeCompanionPos());
     setDock("send");
-    setImportStatus(
-      "Send to machine is open — load your G-code in step 1, then use steps 2–3 to touch off and stream over USB.",
-    );
   }, [clearGcodeFetchTimeout]);
 
   const handleImportToKiri = useCallback((answersOverride?: WizardAnswers) => {
@@ -626,6 +685,7 @@ export function FullWorkspace() {
     clearGcodeFetchTimeout();
     setGcodeFetchStatus((s) => (s === "loading" ? "idle" : s));
     setImportBusy(true);
+    setKiriWidgetCount(null);
     setImportStatus(
       "Sending to Kiri… this can take several seconds on first load; the button will unlock when the model is loaded or if something fails.",
     );
@@ -634,7 +694,12 @@ export function FullWorkspace() {
       const built = buildStlForKiri(buffer, effectiveAnswers);
       // Always send wizard-scaled STL so Kiri matches requested dimensions.
       const stlForKiri = built.buffer;
-      const payload = mapWizardToKiri(effectiveAnswers);
+      const payload = mapWizardToKiri(
+        effectiveAnswers,
+        effectiveAnswers.camToolStrategy === "single"
+          ? { singleBitContourAxis: chooseSingleBitContourAxis(built.vertices) }
+          : undefined,
+      );
       const ok = importIntoKiri(iframeRef.current, {
         device: payload.device as Record<string, unknown>,
         process: payload.process as Record<string, unknown>,
@@ -647,6 +712,8 @@ export function FullWorkspace() {
         return;
       }
       setWizardOpen(false);
+      setCompanionPhase("gcode");
+      setGcodePanelPos(getDefaultGcodeCompanionPos());
       setDock("send");
       const stockNote =
         effectiveAnswers.displayUnits === "in"
@@ -657,16 +724,18 @@ export function FullWorkspace() {
       );
       importWatchdogRef.current = window.setTimeout(() => {
         importWatchdogRef.current = null;
-        setImportBusy((busy) => {
-          if (busy) {
-            setImportStatus((prev) =>
-              prev?.includes("Model loaded in Kiri")
-                ? prev
-                : `No confirmation from Kiri yet — check the iframe for the model, or try Import again after it finishes loading.${isKiriDebugEnabled() ? "" : KIRI_DEBUG_TOAST_HINT}`,
-            );
-          }
-          return false;
-        });
+        setImportBusy(false);
+        /**
+         * Hard fail-loud: if after 15s Kiri still hasn't reported any widgets, the STL did NOT
+         * make it into Kiri (most often a silent `fetch(dataUrl)` failure on the iframe side).
+         * Without this the user thinks everything worked, clicks Animate, and sees a bit
+         * moving over an UNCARVED stock — that is the exact symptom they're reporting.
+         */
+        if ((kiriWidgetCountRef.current ?? 0) === 0) {
+          setImportStatus(
+            "Kiri did not load the STL (no model showed up in the platform). Try: 1) refresh this page, 2) click Restart Kiri in the companion, 3) run Setup again. If it keeps happening, open the browser console (F12) and look for [CNCarve] / [Kiri] errors.",
+          );
+        }
       }, 15_000);
     } catch (e) {
       setImportStatus(e instanceof Error ? e.message : String(e));
@@ -680,48 +749,36 @@ export function FullWorkspace() {
         key={kiriIframeKey}
         ref={iframeRef}
         title="Kiri:Moto"
-        src={KIRI_URL}
+        src={getKiriUrl()}
         aria-hidden={wizardOpen}
         className={`absolute inset-0 z-0 h-full w-full border-0 ${wizardOpen ? "pointer-events-none" : ""}`}
         allow="fullscreen"
         onLoad={() => setKiriFrameLoaded(true)}
       />
 
-      <div className="pointer-events-auto absolute bottom-4 left-4 z-30 group">
-        <div className="flex items-center gap-2 rounded-xl border border-white/10 bg-slate-900/80 px-2 py-2 shadow-lg backdrop-blur-md transition-all duration-200 group-hover:bg-slate-900/92">
+      <div className="pointer-events-auto absolute bottom-4 left-4 z-30">
+        <div className="flex flex-wrap items-center gap-2 rounded-xl border border-white/10 bg-slate-900/90 px-2 py-2 shadow-lg backdrop-blur-md">
           <span className="rounded-md bg-slate-800 px-2 py-1 text-[10px] font-semibold tracking-wide text-slate-200">
             CNC
           </span>
-          <div className="max-w-0 overflow-hidden opacity-0 transition-all duration-200 group-hover:ml-1 group-hover:max-w-xs group-hover:opacity-100">
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={openSetup}
-                className="whitespace-nowrap rounded-lg bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-100 hover:bg-slate-700"
-              >
-                Setup
-              </button>
-              <button
-                type="button"
-                onClick={openMachineCompanion}
-                className="whitespace-nowrap rounded-lg bg-teal-700/80 px-3 py-1.5 text-xs font-medium text-white hover:bg-teal-600"
-              >
-                Companion
-              </button>
-            </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={openSetup}
+              className="whitespace-nowrap rounded-lg bg-slate-800 px-3 py-1.5 text-xs font-medium text-slate-100 hover:bg-slate-700"
+            >
+              Setup
+            </button>
+            <button
+              type="button"
+              onClick={openMachineCompanion}
+              className="whitespace-nowrap rounded-lg bg-teal-700/90 px-3 py-1.5 text-xs font-medium text-white hover:bg-teal-600"
+            >
+              Companion
+            </button>
           </div>
         </div>
       </div>
-
-      {!dock && !wizardOpen && (
-        <button
-          type="button"
-          onClick={openMachineCompanion}
-          className="pointer-events-auto absolute bottom-4 right-4 z-30 rounded-xl border border-white/15 bg-slate-900/90 px-4 py-2 text-sm font-medium text-white shadow-xl backdrop-blur-md hover:bg-slate-800"
-        >
-          Open companion
-        </button>
-      )}
 
       {!wizardOpen && importStatus && (
         <div
@@ -758,64 +815,60 @@ export function FullWorkspace() {
         importBusy={importBusy}
       />
 
-      {dock && (
+      {dock === "send" && companionPhase === "gcode" && (
         <div
-          className="pointer-events-auto absolute z-40 flex h-[min(88dvh,56rem)] w-[min(96vw,32rem)] flex-col overflow-hidden rounded-2xl border border-white/15 bg-slate-900/95 shadow-2xl backdrop-blur-md"
-          style={{ left: machinePanelPos.x, top: machinePanelPos.y }}
+          className="pointer-events-auto absolute z-40 flex max-h-[min(92dvh,52rem)] w-[min(94vw,26rem)] max-w-[26rem] flex-col overflow-hidden rounded-2xl border border-white/15 bg-slate-900/96 text-slate-100 shadow-2xl backdrop-blur-md"
+          style={{
+            left: gcodePanelPos.x,
+            top: gcodePanelPos.y,
+          }}
         >
           <div
-            className="flex cursor-move items-center justify-between border-b border-white/10 px-4 py-3"
+            className="flex shrink-0 cursor-move items-center justify-between gap-2 border-b border-white/10 px-3 py-2.5"
             onPointerDown={(ev) => {
               const rect = (ev.currentTarget.parentElement as HTMLDivElement).getBoundingClientRect();
               dragRef.current = { id: ev.pointerId, dx: ev.clientX - rect.left, dy: ev.clientY - rect.top };
             }}
           >
-            <div className="w-full">
-              <div className="mb-2 flex items-center justify-between">
-                <h2 className="text-sm font-semibold text-white">Machine companion</h2>
-                <button
-                  type="button"
-                  onClick={() => setDock(null)}
-                  className="rounded-lg px-2 py-1 text-xs text-slate-400 hover:bg-white/10 hover:text-white"
-                >
-                  Close
-                </button>
-              </div>
-              <div className="flex flex-wrap items-center gap-2 rounded-xl border border-white/10 bg-slate-800/80 p-2">
-                <button
-                  type="button"
-                  onClick={openSetup}
-                  className="rounded-xl bg-teal-600 px-4 py-2 text-sm font-medium text-white shadow-lg shadow-teal-900/30 hover:bg-teal-500"
-                >
-                  Setup
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setDock("send")}
-                  className="rounded-xl bg-white/15 px-4 py-2 text-sm font-medium text-white ring-1 ring-white/25"
-                >
-                  Send to machine
-                </button>
-                <button
-                  type="button"
-                  onClick={restartKiriWorkspace}
-                  title="Full reload of embedded Kiri — use after WebGL errors or a black 3D view"
-                  className="rounded-xl border border-amber-500/40 bg-amber-950/50 px-4 py-2 text-sm font-medium text-amber-100 ring-1 ring-amber-500/30 hover:bg-amber-900/60"
-                >
-                  Restart Kiri
-                </button>
-              </div>
+            <h2 className="text-sm font-semibold text-white">Machine companion</h2>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={restartKiriWorkspace}
+                title="Reload embedded Kiri after WebGL errors or a black 3D view"
+                className="rounded-lg border border-amber-500/45 bg-amber-950/55 px-2.5 py-1 text-xs font-medium text-amber-100 hover:bg-amber-900/70"
+              >
+                Restart Kiri
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setDock(null);
+                  setCompanionPhase("gcode");
+                }}
+                className="rounded-lg px-2.5 py-1 text-xs text-slate-400 hover:bg-white/10 hover:text-white"
+              >
+                Close
+              </button>
             </div>
           </div>
-          <div className="flex-1 overflow-y-auto p-4">
+          <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-3 [scrollbar-gutter:stable]">
             <SendToMachineWizard
-              iframeReady={isKiriIframeReady(iframeRef.current)}
-              fetchStatus={gcodeFetchStatus}
-              onRequestKiriExport={handleFetchFromKiri}
               onCancelPendingKiriFetch={clearGcodeFetchTimeout}
+              onEnterMachine={() => setCompanionPhase("machine")}
             />
           </div>
         </div>
+      )}
+
+      {dock === "send" && companionPhase === "machine" && (
+        <MachinePopout
+          onBackToGcode={() => setCompanionPhase("gcode")}
+          onCloseDock={() => {
+            setDock(null);
+            setCompanionPhase("gcode");
+          }}
+        />
       )}
     </div>
   );

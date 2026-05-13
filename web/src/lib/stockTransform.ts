@@ -8,6 +8,53 @@ import type { WizardAnswers } from "./presets/types";
 
 export type PatternSize = { x: number; y: number; z: number };
 
+/**
+ * Top-down footprint on the stock for diagrams and auto-fit: use the **two largest**
+ * bounding-box edges as the table shadow, treating the **smallest** as the relief
+ * thickness axis. This matches tall meshes (long axis in STL Z) better than raw X×Y.
+ */
+export function patternFootprintOnStockTopMm(box: PatternSize): {
+  widthMm: number;
+  depthMm: number;
+} {
+  const vals = [box.x, box.y, box.z].sort((a, b) => a - b);
+  const v1 = vals[1];
+  const v2 = vals[2];
+  return {
+    widthMm: Math.max(v1, v2, 1e-6),
+    depthMm: Math.max(Math.min(v1, v2), 1e-6),
+  };
+}
+
+/** Smallest box edge — used with stock thickness when auto-fitting uniform scale. */
+export function patternThicknessHeuristicMm(box: PatternSize): number {
+  return Math.max(1e-6, Math.min(box.x, box.y, box.z));
+}
+
+/**
+ * True when the mesh’s native bounding box (footprint + thickness heuristic) cannot sit
+ * inside the stock with the given margin — same basis as Auto-fit’s usable width/depth/Z.
+ */
+export function nativeMeshExceedsStock(
+  nat: PatternSize,
+  stockWidthMm: number,
+  stockDepthMm: number,
+  stockThicknessMm: number,
+  marginMm: number,
+): boolean {
+  const fp = patternFootprintOnStockTopMm(nat);
+  const thick = patternThicknessHeuristicMm(nat);
+  const m = Math.max(0, marginMm);
+  const usableW = Math.max(1e-6, stockWidthMm - 2 * m);
+  const usableD = Math.max(1e-6, stockDepthMm - 2 * m);
+  const usableZ = Math.max(0.5, stockThicknessMm - m);
+  return (
+    fp.widthMm > usableW + 1e-3 ||
+    fp.depthMm > usableD + 1e-3 ||
+    thick > usableZ + 1e-3
+  );
+}
+
 function isLikelyBinaryStl(buffer: ArrayBuffer): boolean {
   if (buffer.byteLength < 84) return false;
   const n = new DataView(buffer).getUint32(80, true);
@@ -35,7 +82,13 @@ export function readNativeStlSize(stlBuffer: ArrayBuffer): PatternSize | null {
 export function buildStlForKiri(
   stlBuffer: ArrayBuffer,
   answers: WizardAnswers,
-): { buffer: ArrayBuffer; nativeSize: PatternSize; finalSize: PatternSize } {
+): {
+  buffer: ArrayBuffer;
+  nativeSize: PatternSize;
+  finalSize: PatternSize;
+  /** Scaled triangle soup (9 floats per triangle), same coordinates as `buffer`. */
+  vertices: Float32Array;
+} {
   if (!isLikelyBinaryStl(stlBuffer)) {
     throw new Error(
       "This does not look like a binary STL. Please export a binary STL from your CAD program.",
@@ -114,5 +167,6 @@ export function buildStlForKiri(
     buffer: encodeBinaryStlWithNormals(vertices),
     nativeSize,
     finalSize,
+    vertices,
   };
 }

@@ -1,2 +1,11 @@
 .DS_Store
 **/.DS_Store
+
+# Local package store (never commit)
+.pnpm-store/
+
+# Optional local Kiri/grid-apps checkout (large; not required for Vercel — Kiri loads from grid.space)
+vendor/
+
+# Root-level tooling caches
+node_modules/

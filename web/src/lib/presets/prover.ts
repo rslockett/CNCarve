@@ -1,4 +1,5 @@
 import type { MachinePreset } from "./types";
+import { huhaoTapermill1003ForKiri, proverKitEngraveVeeTapermill1007ForKiri } from "../huhaoVeeBit";
 
 /**
  * SainSmart 3018-ProVER–style hobby mill preset.
@@ -16,8 +17,8 @@ export const PROVER_PRESET: MachinePreset = {
   maxHeight: 45,
   /** Kiri stock id → ⅛″ flat (“end 1/8”) */
   defaultRoughToolId: 1001,
-  /** Kiri stock id → ⅛″ vee engraver (“vee 1/8”) */
-  defaultDetailToolId: 1003,
+  /** Default finishing V: **1007** = ProVER box kit narrow engraving vee (short shank). Pick **1003** for HUHAO. */
+  defaultDetailToolId: 1007,
   spindleMaxRpm: 10000,
 
   device: {
@@ -43,25 +44,20 @@ export const PROVER_PRESET: MachinePreset = {
     gcodePost: ["M5 ; spindle off", "M30 ; end"],
     gcodeDwell: ["G4 P{time}"],
     gcodeSpindle: ["M3 S{speed}"],
-    gcodeChange: ["; Tool change — pause and re-zero Z before continuing"],
+    /**
+     * No `M6` here — stock GRBL 1.1 rejects `M6` with error:20, and single-bit jobs do not need a
+     * tool change line. Kiri still emits spindle `M3` from `gcodeSpindle` when `spindleMax` is set.
+     */
+    gcodeChange: ["; (single tool — no M6; pause here only if you physically swap the bit)"],
     gcodeFExt: "nc",
   },
 
-  /** Mirrors grid.space defaults so wizard labels match what Kiri shows for those ids */
+  /**
+   * **1007** = ProVER kit narrow engraving vee (approx. **20° included**, not published by SainSmart);
+   * **1003** = HUHAO 20° aftermarket spec (longer shank). Both `metric: true` (mm). Outline silhouette
+   * expand uses whichever tapermill you select (`wizard.ts`). **1001** / **1004** stay inch-based.
+   */
   tools: [
-    {
-      id: 1003,
-      number: 4,
-      type: "tapermill",
-      name: '⅛" V-bit (vee — typical bundle bit)',
-      metric: false,
-      shaft_diam: 0.125,
-      shaft_len: 1,
-      flute_diam: 0.125,
-      flute_len: 1.5,
-      taper_angle: 5.3,
-      taper_tip: 0,
-    },
     {
       id: 1001,
       number: 2,
@@ -74,6 +70,8 @@ export const PROVER_PRESET: MachinePreset = {
       flute_len: 1.5,
       taper_tip: 0,
     },
+    proverKitEngraveVeeTapermill1007ForKiri(),
+    huhaoTapermill1003ForKiri(),
     {
       id: 1004,
       number: 5,

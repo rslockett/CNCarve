@@ -67,4 +67,9 @@ export interface WizardAnswers {
   stockOnBed: StockOnBed;
   stlFileName: string | null;
   hasProbePlate: boolean;
+  /**
+   * Plan preview only: mirror mesh in Y about the placed mesh’s depth midpoint (XZ plane).
+   * Does **not** change the binary STL sent to Kiri — import matches the scaled file geometry.
+   */
+  patternTopViewMirrorY: boolean;
 }

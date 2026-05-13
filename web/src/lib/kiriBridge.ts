@@ -1,7 +1,53 @@
 /** Communicate with embedded Kiri:Moto via postMessage (same protocol as grid.space frame helper). */
 
+/**
+ * Kiri iframe URL.
+ *
+ * **Default:** hosted `https://grid.space/kiri/`. That bundle ships the full Kiri runtime
+ * (workers, three.js, slicer) and **does honor `op.expand`** on the outline op — confirmed in
+ * the cnc-002.nc export where the ~2.2 mm expand we sent showed up in the carved silhouette.
+ *
+ * **Why not local?** `vendor/grid-apps/web/` only contains HTML/CSS; the bundled JS lives under
+ * `web/lib/` in the upstream build artifact and is not in this repo, so a same-origin `/kiri/`
+ * frame would load the UI shell with no engine (Slice/Preview/Animate all silently no-op).
+ *
+ * **Override:** set `NEXT_PUBLIC_KIRI_URL` to a full URL if you have a custom Kiri build.
+ */
+function kiriUrlFromEnv(): string {
+  const raw =
+    typeof process !== "undefined"
+      ? process.env.NEXT_PUBLIC_KIRI_URL?.trim() ?? ""
+      : "";
+  if (raw.length > 0) {
+    return raw.endsWith("/") ? raw : `${raw}/`;
+  }
+  return "https://grid.space/kiri/";
+}
+
+/** Iframe `src`. */
+export function getKiriUrl(): string {
+  const u = kiriUrlFromEnv();
+  return u.endsWith("/") ? u : `${u}/`;
+}
+
+/** `postMessage` `targetOrigin` — must match the iframe document’s origin. */
+export function kiriPostMessageTargetOrigin(): string {
+  const u = kiriUrlFromEnv();
+  if (u.startsWith("http://") || u.startsWith("https://")) {
+    try {
+      return new URL(u).origin;
+    } catch {
+      return "https://grid.space";
+    }
+  }
+  if (typeof window !== "undefined") {
+    return window.location.origin;
+  }
+  return "https://grid.space";
+}
+
+/** Legacy grid host (still accepted on inbound `postMessage` from some embeds). */
 export const KIRI_ORIGIN = "https://grid.space";
-export const KIRI_URL = "https://grid.space/kiri/";
 
 /** True when `next dev` / `NODE_ENV=development` or `localStorage cnkiri.debug === "1"`. */
 export function isKiriDebugEnabled(): boolean {
@@ -55,7 +101,7 @@ export function invalidatePendingKiriImports(): void {
 }
 
 /** Bump when STL→Kiri transport changes (check console to confirm you are not on a cached bundle). */
-export const KIRI_BRIDGE_STL_TRANSPORT = "stl-dataurl-name-v6";
+export const KIRI_BRIDGE_STL_TRANSPORT = "stl-parse-then-load-v7";
 
 function kiriLog(phase: string, detail: unknown) {
   if (isKiriDebugEnabled()) console.info(`[CNCarve → Kiri] ${phase}`, detail);
@@ -136,7 +182,7 @@ export function postToKiri(
         ? parseVal.byteLength
         : undefined;
   kiriLog("postMessage", { keys, stlBytes: size });
-  w.postMessage(payload, KIRI_ORIGIN, transfer);
+  w.postMessage(payload, kiriPostMessageTargetOrigin(), transfer);
   return true;
 }
 
@@ -286,12 +332,30 @@ export function importIntoKiri(
     }),
   );
   schedule(1500, "clear", () => postToKiri(w, { clear: true }));
-  schedule(8000, "load STL via named data URL (force STL route)", () => {
+  /**
+   * Primary route: hand Kiri the raw STL bytes via `parse` (frame.js `data.parse` + `type:'stl'`).
+   * This skips the `fetch(dataUrl)` round-trip that `data.load` requires — the previous data-URL
+   * transport silently failed in some Chrome/grid.space combinations, leaving Kiri with **no
+   * widget**. With no widget, Animate plays a stale/empty toolpath and the wood never carves —
+   * exactly the "bit moves but nothing is being carved" symptom.
+   */
+  schedule(3500, "parse STL (direct ArrayBuffer route)", () => {
+    const payload = stlPayloadForKiriParse(args.stlBuffer);
+    kiriLog("stl parse", {
+      transport: KIRI_BRIDGE_STL_TRANSPORT,
+      method: "parse",
+      rawBytes: args.stlBuffer.byteLength,
+      sentBytes: payload.byteLength,
+    });
+    postToKiri(w, { parse: payload, type: "stl" });
+  });
+  /** Belt-and-braces: also send the data-URL `load` route in case `parse` is filtered. */
+  schedule(8000, "load STL via named data URL (fallback)", () => {
     const payload = stlPayloadForKiriParse(args.stlBuffer);
     const dataUrl = `data:model/stl;name=model.stl;base64,${arrayBufferToBase64(payload)}`;
-    kiriLog("parse payload", {
+    kiriLog("stl load fallback", {
       transport: KIRI_BRIDGE_STL_TRANSPORT,
-      rawBytes: args.stlBuffer.byteLength,
+      method: "load",
       sentBytes: payload.byteLength,
       dataUrlLength: dataUrl.length,
     });
@@ -305,7 +369,7 @@ export function importIntoKiri(
   schedule(11_000, "process + device (re-apply after load)", () =>
     postToKiri(w, { process: args.process, device: args.device }),
   );
-  schedule(11_300, "controller (force mm units after load)", () =>
+  schedule(11_300, "controller (force mm units after load + manifold for animate carve)", () =>
     postToKiri(w, { controller: controllerWithMmUnits }),
   );
   schedule(14_000, "process + device (re-apply after load #2)", () =>

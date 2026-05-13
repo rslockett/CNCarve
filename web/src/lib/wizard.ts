@@ -1,5 +1,10 @@
 import type { JsonObject, WizardAnswers } from "./presets/types";
 import { MACHINE_PRESETS, PROVER_PRESET } from "./presets/prover";
+import {
+  deriveReliefContourParams,
+  fluteDiameterMmFromPresetTool,
+  type ReliefCamQualityId,
+} from "./reliefCamOpt";
 
 export type SafetyIssue = { level: "warn" | "error"; message: string };
 
@@ -42,52 +47,35 @@ const MATERIALS: Record<
   },
 };
 
+/**
+ * Per-tier **feeds / material scaling** and labels. Contour **step** and outline step-over come from
+ * `reliefCamOpt.ts` (scallop proxy × tool Ø); **tolerance / flatness** stay explicit per tier there
+ * (Kiri uses tolerance as XY slice pitch — must not track coarse step or previews voxelize).
+ */
 const QUALITY = {
   fast: {
-    tolerance: 0.082,
-    stepScale: 1.35,
-    label: "Faster (less detail)",
-    /** Contour “Step over” as fraction of flute ø (Kiri multiplies by ø for spacing). */
-    contourStep: 0.26,
-    /** Outline Z depth per pass (mm scale); higher = fewer outline levels, rougher. */
-    outlineDownMul: 1.12,
-    outlineOver: 0.44,
-    reduction: 3,
-    flatness: 0.0019,
-    contourFeedMul: 0.9,
+    stepScale: 1.58,
+    label: "Quick — fastest, light ridges",
+    outlineDownMul: 1.26,
+    contourFeedMul: 1.04,
   },
   balanced: {
-    tolerance: 0.054,
-    stepScale: 1,
-    label: "Balanced",
-    contourStep: 0.15,
-    outlineDownMul: 1,
-    outlineOver: 0.36,
-    reduction: 2,
-    flatness: 0.001,
-    contourFeedMul: 0.84,
+    stepScale: 1.22,
+    label: "Balanced — everyday default",
+    outlineDownMul: 1.16,
+    contourFeedMul: 1.02,
   },
   fine: {
-    tolerance: 0.029,
-    stepScale: 0.76,
-    label: "Finer (slower)",
-    contourStep: 0.085,
-    outlineDownMul: 0.82,
-    outlineOver: 0.28,
-    reduction: 1,
-    flatness: 0.00075,
-    contourFeedMul: 0.78,
+    stepScale: 1.14,
+    label: "Sharper — finer detail",
+    outlineDownMul: 1.14,
+    contourFeedMul: 1.04,
   },
   replica: {
-    tolerance: 0.012,
-    stepScale: 0.5,
-    label: "Replica (very slow, max detail)",
-    contourStep: 0.042,
-    outlineDownMul: 0.62,
-    outlineOver: 0.18,
-    reduction: 0,
-    flatness: 0.0004,
-    contourFeedMul: 0.68,
+    stepScale: 0.98,
+    label: "Showpiece — slowest, tightest",
+    outlineDownMul: 0.98,
+    contourFeedMul: 0.92,
   },
 } as const;
 
@@ -142,6 +130,131 @@ export function getMachineOrDefault(id: string) {
 }
 
 /**
+ * **Reduced** mm of axial pad past relief floor for outline. Old value 1.0 + 0.95 (cone axial pad)
+ * inflated `cutDepthMm` by ~2 mm — that pushed `expand` to ~2.2 mm when actual cone radius needed
+ * only ~1.0 mm, producing a moat ~1 mm too wide on each side.
+ */
+const OUTLINE_PAST_MESH_MM = 0.25;
+/** Tiny axial pad in the cone-radius estimate; the real cut depth is `patternDepth + this`. */
+const OUTLINE_CONE_AXIAL_PAD_MM = 0.15;
+const OUTLINE_MIN_CLEARANCE_ABOVE_STOCK_FLOOR_MM = 0.35;
+
+function presetToolById(machineId: string, toolId: number): JsonObject | undefined {
+  const p = getMachineOrDefault(machineId);
+  return p.tools.find((x) => (x.id as number) === toolId) as JsonObject | undefined;
+}
+
+/** V-bits / taper balls widen with depth — silhouette outline expand uses this. */
+export function toolWidensWithDepth(machineId: string, toolId: number): boolean {
+  const t = presetToolById(machineId, toolId);
+  const ty = String(t?.type ?? "");
+  return ty === "tapermill" || ty === "taperball";
+}
+
+/**
+ * `ov_botz` in Kiri = `bottom_stock + ov_botz` for outline Z bottom. We want outline to go as deep
+ * as the relief floor (+ a tiny axial pad) so the V-bit fully clears the perimeter. The outline
+ * is **offset outward** (via `expand` / `outlineSilhouetteExpandMm`) to account for the V-bit
+ * cone getting wider as it cuts deeper — that's what prevents the outline from eating the edge
+ * of the STL design.
+ */
+function reliefOutlineOvBotZ(stockThicknessMm: number, patternDepthMm: number): number | undefined {
+  if (patternDepthMm < 0.12) return undefined;
+  const deepestMm = patternDepthMm + OUTLINE_PAST_MESH_MM;
+  const cappedDepth = Math.min(
+    deepestMm,
+    stockThicknessMm - OUTLINE_MIN_CLEARANCE_ABOVE_STOCK_FLOOR_MM,
+  );
+  const ov = stockThicknessMm - cappedDepth;
+  if (ov < 0.05) return undefined;
+  return ov;
+}
+
+/**
+ * Millimeters of **outside** clearance for the outline trace on tapered tools.
+ *
+ * Kiri’s outline “expand” field is forwarded into the trace op as **`tr_over`**
+ * (see `vendor/.../op-outline.js`): that replaces the default `[fluteØ/2, …]` offset with a
+ * single XY offset so the **tip** stays at least the **cone radius at max cut depth** outside the
+ * STL shadow (half the envelope diameter at the deepest pass, plus a tiny cushion).
+ */
+export function outlineSilhouetteExpandMm(
+  machineId: string,
+  finishToolId: number,
+  patternDepthMm: number,
+): number | undefined {
+  const tool = presetToolById(machineId, finishToolId);
+  if (!tool || patternDepthMm < 0.08) return undefined;
+  const ty = String(tool.type ?? "");
+  if (ty !== "tapermill" && ty !== "taperball") return undefined;
+
+  const metric = !!tool.metric;
+  const u = metric ? 1 : 25.4;
+  const fluteD = Number(tool.flute_diam) * u;
+  const fluteL = Number(tool.flute_len) * u;
+  const shaftD = Number(tool.shaft_diam) * u;
+  const tip = Number(tool.taper_tip ?? 0) * u;
+  if (!(fluteD > 0 && fluteL > 0)) return undefined;
+
+  const depthRelief = Math.min(Math.max(0, patternDepthMm), 120);
+  /** Deepest axial engagement along the cone (relief depth + past mesh + small pad for walls). */
+  const cutDepthMm = Math.min(
+    fluteL,
+    depthRelief + OUTLINE_PAST_MESH_MM + OUTLINE_CONE_AXIAL_PAD_MM,
+  );
+  /**
+   * Extra radial mm for raised border / “rope” relief so the flank does not clip detail.
+   * (Still capped by `Math.min(18, …)` below.)
+   */
+  const cushionMm = 0.32;
+  const bonus = Number(
+    (tool as { outlineSilhouetteBonusMm?: number }).outlineSilhouetteBonusMm ?? 0,
+  );
+  const b = Number.isFinite(bonus) && bonus >= 0 ? bonus : 0;
+  const fluteR = fluteD / 2;
+  const shaftR = shaftD > 0.01 ? shaftD / 2 : fluteR;
+
+  if (ty === "tapermill") {
+    const radialHalf = Math.max(1e-6, (fluteD - tip) / 2);
+    const gammaFromFlute = Math.atan2(radialHalf, fluteL);
+    const taperHalfDeg = Number(tool.taper_angle);
+    const gammaFromSpec =
+      Number.isFinite(taperHalfDeg) && taperHalfDeg > 0.05 && taperHalfDeg < 89
+        ? (taperHalfDeg * Math.PI) / 180
+        : gammaFromFlute;
+    const gamma = Math.max(gammaFromFlute, gammaFromSpec);
+    const tipR = Math.max(0, tip / 2);
+    const coneR = Math.min(fluteD / 2, tipR + cutDepthMm * Math.tan(gamma));
+    /**
+     * Hosted Kiri uses `tr_over` **instead of** `[fluteØ/2, …]` for outline-style trace offset
+     * (`op-area.js`). So `tr_over` must be ≥ nominal flute radius, not only the cone radius at
+     * depth — otherwise the path sits **inside** the stock silhouette and eats border rope detail.
+     */
+    const shaftClear = Math.max(0, shaftR - coneR) * 0.75;
+    const fromCone = coneR + cushionMm + b + shaftClear;
+    const expand = Math.max(fluteR + 0.06, fromCone);
+    return Math.min(18, Math.max(0.08, expand));
+  }
+
+  const depthBlend = Math.min(1, cutDepthMm / Math.max(fluteL * 0.72, 1e-6));
+  const shaftRing = Math.max(0, (shaftD - fluteD) / 2);
+  const radialHalf = Math.max(1e-6, (fluteD - tip) / 2);
+  const gammaFromFlute = Math.atan2(radialHalf, fluteL);
+  const taperHalfDeg = Number(tool.taper_angle);
+  const gammaFromSpec =
+    Number.isFinite(taperHalfDeg) && taperHalfDeg > 0.05 && taperHalfDeg < 89
+      ? (taperHalfDeg * Math.PI) / 180
+      : gammaFromFlute;
+  const gamma = Math.max(gammaFromFlute, gammaFromSpec);
+  const ballTipR = Math.max(0, tip / 2);
+  const coneR = Math.min(fluteD / 2, ballTipR + cutDepthMm * Math.tan(gamma));
+  const shaftClear = Math.max(0, shaftR - coneR) * 0.75;
+  const fromCone = coneR + cushionMm + shaftRing * depthBlend + b + shaftClear;
+  const expand = Math.max(fluteR + 0.06, fromCone);
+  return Math.min(18, Math.max(0.08, expand));
+}
+
+/**
  * Kiri:Moto CAM (from grid-apps / docs), mapped from wizard “Quality”:
  * - **Precision** (`camTolerance` / op `tolerance`) — mm chordal resolution for mesh slices;
  *   lower = follows STL facets tighter, more toolpath points, slower.
@@ -150,11 +263,29 @@ export function getMachineOrDefault(id: string) {
  * - **Reduction** (`camContourReduce` / op `reduction`) — simplifies internal mesh before contouring;
  *   0 keeps the most detail; higher values coarsen (faster, less faithful on fine relief).
  * - **Step over** (`camContourOver` / op `step`) — spacing between contour passes as a multiple of
- *   tool flute diameter (per Kiri topo).
+ *   tool flute diameter (per Kiri topo). CNCarve derives step from a **constant-cusp** proxy in
+ *   `reliefCamOpt.ts`; tolerance / flatness are tier tables (slice resolution), only capped vs pass width.
  * Outline Z step uses `outlineDown × outlineDownMul` so finer qualities take shallower outline cuts.
  */
 
-/** Matches Kiri `createPopOp('outline', …)` record fields used in ops[]. */
+/**
+ * Creates an outline operation for relief carving using Kiri's **Area** op type.
+ *
+ * **Why Area instead of Outline?**
+ * The built-in `outline` op type on hosted Kiri (grid.space) ignores the `expand` field,
+ * which we need for V-bit offset. However, the `area` op type supports `tr_over` directly
+ * in trace mode, allowing us to specify a custom outward offset.
+ *
+ * When configured with:
+ * - `mode: "trace"` — traces around polygon boundaries
+ * - `shadow: true` — uses the part's 2D silhouette (same as outline would)
+ * - `drape: true` — follows the 3D surface, stepping down with the relief
+ * - `base: true` — uses the base shadow at all Z levels
+ * - `tr_type: "outside"` — traces outside the silhouette
+ * - `tr_over: expandMm` — our calculated V-bit offset!
+ *
+ * This achieves the same result as the patched outline op but works on hosted Kiri.
+ */
 function kiriOutlineOp(args: {
   tool: number;
   spindle: number;
@@ -163,13 +294,20 @@ function kiriOutlineOp(args: {
   plunge: number;
   step: number;
   steps: number;
+  ovBotz?: number;
+  expandMm?: number;
 }): JsonObject {
-  return {
-    type: "outline",
+  const rec: JsonObject = {
+    type: "area",
+    mode: "trace",
+    shadow: true,
+    drape: true,
+    base: true,
+    tr_type: "outside",
     tool: args.tool,
     direction: "climb",
     spindle: args.spindle,
-    step: args.step,
+    over: args.step,
     steps: args.steps,
     down: args.down,
     rate: args.rate,
@@ -177,13 +315,18 @@ function kiriOutlineOp(args: {
     dogbones: false,
     revbones: false,
     omitthru: false,
-    omitvoid: false,
-    outside: true,
-    inside: false,
-    wide: false,
+    thru: true,
     ov_topz: 0,
     ov_botz: 0,
   };
+  if (args.ovBotz !== undefined && args.ovBotz >= 0.05) {
+    rec.ov_botz = args.ovBotz;
+  }
+  // V-bit offset: tr_over tells OpArea how far to offset the trace from the silhouette
+  if (args.expandMm !== undefined && args.expandMm >= 0.02) {
+    rec.tr_over = args.expandMm;
+  }
+  return rec;
 }
 
 /**
@@ -233,8 +376,19 @@ function kiriContourOp(args: {
   };
 }
 
+export type MapWizardToKiriOpts = {
+  /**
+   * For single-bit strategy only: contour axis chosen from the scaled mesh (quality vs time).
+   * When omitted, defaults to `"Y"` for backward compatibility.
+   */
+  singleBitContourAxis?: "X" | "Y";
+};
+
 /** Map wizard answers + STL filename into Kiri partial settings */
-export function mapWizardToKiri(answers: WizardAnswers): {
+export function mapWizardToKiri(
+  answers: WizardAnswers,
+  opts?: MapWizardToKiriOpts,
+): {
   device: JsonObject;
   process: JsonObject;
   controller: JsonObject;
@@ -243,6 +397,13 @@ export function mapWizardToKiri(answers: WizardAnswers): {
   const preset = getMachineOrDefault(answers.machineId);
   const mat = MATERIALS[answers.materialId] ?? MATERIALS.softwood;
   const q = QUALITY[answers.qualityId] ?? QUALITY.balanced;
+  const qualityId: ReliefCamQualityId =
+    answers.qualityId === "fast" ||
+    answers.qualityId === "balanced" ||
+    answers.qualityId === "fine" ||
+    answers.qualityId === "replica"
+      ? answers.qualityId
+      : "balanced";
 
   const roughToolIdNorm = normalizeToolId(
     answers.roughToolId,
@@ -267,14 +428,37 @@ export function mapWizardToKiri(answers: WizardAnswers): {
     answers.camToolStrategy === "single" ? singleToolIdNorm : roughToolIdNorm;
 
   const singleBit = answers.camToolStrategy === "single";
+  const singleContourAxis: "X" | "Y" =
+    singleBit && opts?.singleBitContourAxis === "X" ? "X" : "Y";
 
   const f = mat.factor * q.stepScale;
 
   const roughDown = Math.max(0.5, Math.min(2.5, 1.5 * f));
   const outlineDown = Math.max(0.3, Math.min(1.2, roughDown * 0.6));
-  const contourStepFrac = Math.max(0.01, Math.min(1, q.contourStep));
-  const contourTolerance = Math.max(0.001, Math.min(10, q.tolerance));
-  const contourFlatness = Math.max(0.0001, Math.min(1, q.flatness));
+
+  const stockX = Math.max(1, answers.stockWidthMm);
+  const stockY = Math.max(1, answers.stockDepthMm);
+  const stockZ = Math.max(0.5, answers.stockThicknessMm);
+  const centerStock = answers.patternPlacement === "center";
+
+  const patternDepthMm = Math.max(0, answers.patternSizeMm.z);
+  const px = Math.max(0, answers.patternSizeMm.x);
+  const py = Math.max(0, answers.patternSizeMm.y);
+  const patternSpanMm =
+    Math.max(px, py) >= 2 ? Math.max(px, py) : Math.min(stockX, stockY) * 0.72;
+
+  const finishToolRow = presetToolById(answers.machineId, finishTool);
+  const fluteMm = fluteDiameterMmFromPresetTool(finishToolRow);
+  const camDerived = deriveReliefContourParams({
+    qualityId,
+    fluteDiameterMm: fluteMm,
+    patternSpanMm,
+    patternDepthMm,
+  });
+  const contourStepFrac = Math.max(0.01, Math.min(1, camDerived.contourStep));
+  const contourTolerance = Math.max(0.001, Math.min(10, camDerived.tolerance));
+  const contourFlatness = Math.max(0.0001, Math.min(1, camDerived.flatness));
+  const contourReduction = camDerived.reduction;
 
   const camFastFeed = Math.min(2500, Math.round(1200 * f));
   const camFastFeedZ = Math.min(400, Math.round(200 * f));
@@ -294,10 +478,12 @@ export function mapWizardToKiri(answers: WizardAnswers): {
   /** Step-over fraction × tool ø (matches Kiri Rough op semantics). */
   const roughStepFrac = Math.max(0.2, Math.min(0.65, 0.42 / q.stepScale));
 
-  const stockX = Math.max(1, answers.stockWidthMm);
-  const stockY = Math.max(1, answers.stockDepthMm);
-  const stockZ = Math.max(0.5, answers.stockThicknessMm);
-  const centerStock = answers.patternPlacement === "center";
+  const outlineOvBotz = reliefOutlineOvBotZ(stockZ, patternDepthMm);
+  const silhouetteExpandMm = outlineSilhouetteExpandMm(
+    answers.machineId,
+    finishTool,
+    patternDepthMm,
+  );
 
   const contourBase = {
     tool: finishTool,
@@ -306,7 +492,7 @@ export function mapWizardToKiri(answers: WizardAnswers): {
     rate: contourSpeed,
     tolerance: contourTolerance,
     flatness: contourFlatness,
-    reduction: q.reduction,
+    reduction: contourReduction,
   };
 
   /** Single-bit outline takes shallower passes when quality asks for finer detail. */
@@ -314,7 +500,7 @@ export function mapWizardToKiri(answers: WizardAnswers): {
     0.22,
     Math.min(1.2, outlineDown * q.outlineDownMul),
   );
-  const outlineOverKiri = Math.max(0.08, Math.min(0.65, q.outlineOver));
+  const outlineOverKiri = Math.max(0.08, Math.min(0.65, camDerived.outlineOver));
 
   const ops: JsonObject[] = [];
   if (singleBit) {
@@ -327,10 +513,12 @@ export function mapWizardToKiri(answers: WizardAnswers): {
         plunge: Math.round(120 * f),
         step: outlineOverKiri,
         steps: 1,
+        ovBotz: outlineOvBotz,
+        expandMm: silhouetteExpandMm,
       }),
       kiriContourOp({
         ...contourBase,
-        axis: "X",
+        axis: singleContourAxis,
         inside: true,
         clipToStock: false,
       }),
@@ -360,6 +548,9 @@ export function mapWizardToKiri(answers: WizardAnswers): {
     processName: `CNCarve-${answers.qualityId}`,
     camTolerance: contourTolerance,
     camFlatness: contourFlatness,
+    camEaseDown: true,
+    camContourXOn: !singleBit || singleContourAxis === "X",
+    camContourYOn: !singleBit || singleContourAxis === "Y",
     camStockClipTo: !singleBit,
     camMillDirection: "climb",
     camZAnchor: "top",
@@ -393,11 +584,15 @@ export function mapWizardToKiri(answers: WizardAnswers): {
     camContourSpeed: contourSpeed,
     camContourAngle: 85,
     camContourLeave: 0,
-    camContourReduce: q.reduction,
+    camContourReduce: contourReduction,
     camContourBridge: 0,
     camContourBottom: false,
     camContourCurves: false,
     camContourIn: singleBit,
+    camRoundCorners: true,
+    camArcEnabled: false,
+    camArcResolution: 1,
+    camArcTolerance: 0.005,
     camTraceTool: finishTool,
     camTraceSpindle: spindle,
     camTraceSpeed: Math.round(600 * f),
@@ -405,7 +600,15 @@ export function mapWizardToKiri(answers: WizardAnswers): {
     camStockY: stockY,
     camStockZ: stockZ,
     camStockOn: true,
-    camStockOffset: true,
+    /**
+     * **MUST be false** — `camStockOffset: true` makes Kiri interpret `camStockX/Y/Z` as
+     * **offsets added to the part bounds**, not absolute board sizes. With it on, a user-set
+     * 100×100×20 mm board became 145×163×25 mm in cnc-003.nc (part 44.88+100 etc.) and every
+     * downstream depth/clearance calculation broke — including the outline going to Z = −10.7
+     * mm when the relief is only 5 mm deep. We always want **absolute** stock so the user's
+     * configured board dimensions are honored exactly.
+     */
+    camStockOffset: false,
     camOriginTop: true,
     camDepthFirst: true,
     ctOriginCenter: centerStock,
@@ -415,11 +618,25 @@ export function mapWizardToKiri(answers: WizardAnswers): {
 
   const device: JsonObject = {
     ...preset.device,
+    /**
+     * Kiri's CAM exporter only emits `M3 S…` when `spindleMax` is non-zero (`export.js` gates on
+     * `spindleMax && newSpindle && …`). The hosted iframe can merge in a saved device profile with
+     * `spindleMax: 0`, which produces G-code with **no M3 at all** (only `M6` / rapids / cuts) —
+     * the spindle never spins. Always force this from our machine preset so exports stay sane.
+     */
+    spindleMax: Math.max(1, Math.round(preset.spindleMaxRpm)),
     bedWidth: preset.bedWidth,
     bedDepth: preset.bedDepth,
     maxHeight: preset.maxHeight,
     originCenter: answers.stockOnBed === "centered",
   };
+
+  const meshDetailBase =
+    answers.qualityId === "replica" || answers.qualityId === "fine"
+      ? "best"
+      : answers.qualityId === "fast"
+        ? "fair"
+        : "good";
 
   const controller: JsonObject = {
     threaded: false,
@@ -427,6 +644,15 @@ export function mapWizardToKiri(answers: WizardAnswers): {
     autoLayout: false,
     // Force mm in embedded Kiri for deterministic CAM sizing/stock mapping.
     units: "mm",
+    // Always keep import detail ≥ meshDetailBase — coarsening here made Preview/Animate look voxelized.
+    detail: meshDetailBase,
+    /**
+     * Enables CSG stock-slice subtraction during CAM Animate so the wood **visually carves out**
+     * as the bit traces the toolpath (without this, the bit moves but stock stays solid — the
+     * complaint where "the little bit moves but nothing is being carved into the wood"). Kiri’s
+     * `anim-3d` worker checks `settings.controller.manifold` and only builds the slices when true.
+     */
+    manifold: true,
   };
 
   return {
@@ -515,7 +741,7 @@ export function validateSafety(
     issues.push({
       level: "warn",
       message:
-        "Single-tool mode runs Outline (outside silhouette) then Contour along X with Inside-only clipping so finishing stays on your STL silhouette — pick Fine/Replica when you want Precision/Reduction/Flatness tighter in Kiri.",
+        "Single-tool mode runs Outline then Contour on your silhouette. Use Sharper or Showpiece when you want tighter Kiri precision settings.",
     });
   }
 
@@ -585,5 +811,6 @@ export function defaultWizardAnswers(): WizardAnswers {
     stockOnBed: "front_left",
     stlFileName: null,
     hasProbePlate: false,
+    patternTopViewMirrorY: true,
   };
 }
