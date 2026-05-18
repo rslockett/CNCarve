@@ -11,7 +11,8 @@ import type {
 import {
   nativeMeshExceedsStock,
   patternFootprintOnStockTopMm,
-  patternThicknessHeuristicMm,
+  reliefThicknessAxis,
+  uniformScaleToFitStock,
   readNativeStlSize,
 } from "@/lib/stockTransform";
 import { lengthFromDisplay, lengthToDisplay } from "@/lib/units";
@@ -235,16 +236,7 @@ export function SetupWizard({
     const thickMm = Number.isFinite(draftT) ? Math.max(0.5, draftT) : answers.stockThicknessMm;
     const marginMm = Number.isFinite(draftM) ? Math.max(0, draftM) : answers.stockMarginMm;
 
-    const usableW = Math.max(1, widthMm - 2 * marginMm);
-    const usableD = Math.max(1, depthMm - 2 * marginMm);
-    const usableZ = Math.max(0.5, thickMm - marginMm);
-    const fp = patternFootprintOnStockTopMm(nat);
-    const thick = patternThicknessHeuristicMm(nat);
-    const s = Math.min(
-      usableW / fp.widthMm,
-      usableD / fp.depthMm,
-      usableZ / thick,
-    );
+    const s = uniformScaleToFitStock(nat, widthMm, depthMm, thickMm, marginMm);
 
     setAnswers((a) => ({
       ...a,
@@ -638,10 +630,16 @@ export function SetupWizard({
               Auto-fit on stock
             </button>
             <p className="mt-1 text-xs text-slate-500">
-              Fits to usable width/depth (top view) inside your margin with
-              uniform scaling. If Z is still too tall, safety warnings below will
-              flag it so you can reduce carve depth manually.
+              Fits inside your margin with one uniform scale on X, Y, and Z (no
+              squish). Uses STL X×Y on the bed when Z is the thin carve-depth
+              axis; if the preview still looks wrong, re-export the STL with Z up.
             </p>
+            {stlNativeSize && reliefThicknessAxis(stlNativeSize) !== "z" && (
+              <p className="mt-1 text-xs text-amber-200/85">
+                This file’s thinnest axis is not Z — for a correct top preview,
+                export with carve depth along Z if you can.
+              </p>
+            )}
             <label className="mt-4 flex cursor-pointer items-center gap-2 text-sm text-slate-300">
               <input
                 type="checkbox"
