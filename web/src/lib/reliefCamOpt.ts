@@ -18,10 +18,10 @@ export type ReliefCamQualityId = "fast" | "balanced" | "fine" | "replica";
  * relief. **Showpiece (`replica`)** stays the tightest tier for when time is secondary.
  */
 const TARGET_CUSP_MM: Record<ReliefCamQualityId, number> = {
-  fast: 0.140,
-  balanced: 0.100,
-  fine: 0.060,
-  replica: 0.030,
+  fast: 0.125,
+  balanced: 0.1,
+  fine: 0.072,
+  replica: 0.034,
 };
 
 /**
@@ -29,30 +29,24 @@ const TARGET_CUSP_MM: Record<ReliefCamQualityId, number> = {
  * Replica stays tight for “best quality / I’ll wait.”
  */
 const TIER_TOLERANCE_MM: Record<ReliefCamQualityId, number> = {
-  fast: 0.115,
-  balanced: 0.098,
-  fine: 0.070,
-  replica: 0.044,
+  fast: 0.13,
+  balanced: 0.11,
+  fine: 0.082,
+  replica: 0.056,
 };
 
 const TIER_FLATNESS: Record<ReliefCamQualityId, number> = {
-  fast: 0.0032,
-  balanced: 0.0022,
-  fine: 0.0014,
-  replica: 0.0009,
+  fast: 0.0035,
+  balanced: 0.0025,
+  fine: 0.00185,
+  replica: 0.00112,
 };
 
-/**
- * In Kiri topo, `density = 1 + reduction`. This controls how coarsely the terrain height is
- * sampled within each scan line. density=2 means every other raster cell; density=1 means
- * every cell (maximum fidelity). Old values (3-6) were too coarse — fine tier was sampling at
- * 0.33mm intervals per point inside each pass, missing sub-millimeter surface detail.
- */
 const REDUCTION: Record<ReliefCamQualityId, number> = {
-  fast: 1,
-  balanced: 1,
-  fine: 0,
-  replica: 0,
+  fast: 5,
+  balanced: 4,
+  fine: 3,
+  replica: 2,
 };
 
 function clamp(n: number, lo: number, hi: number): number {
