@@ -4,17 +4,23 @@ import { useAppState } from "@/context/AppState";
 import { XyTouchOffGuidanceText } from "@/lib/touchOffGuidance";
 import { GcodeFromKiriPanel } from "./GcodeFromKiriPanel";
 import { RunPanel } from "./RunPanel";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type Props = {
   /** Stop waiting for iframe `export.done` when the user loads a file or replaces G-code. */
   onCancelPendingKiriFetch: () => void;
-  /** When set, “Machine” opens the bottom-right popout instead of inline step 2. */
+  /** Kick off the automatic slice → prepare → export pipeline. */
+  onFetchGcodeFromKiri: () => void;
+  /** Current state of the automatic G-code fetch pipeline. */
+  gcodeFetchStatus: "idle" | "loading" | "ready" | "error";
+  /** When set, "Machine" opens the bottom-right popout instead of inline step 2. */
   onEnterMachine?: () => void;
 };
 
 export function SendToMachineWizard({
   onCancelPendingKiriFetch,
+  onFetchGcodeFromKiri,
+  gcodeFetchStatus,
   onEnterMachine,
 }: Props) {
   const { answers, exportedGcode, setExportedGcode } = useAppState();
@@ -22,8 +28,26 @@ export function SendToMachineWizard({
 
   const [step, setStep] = useState(1);
 
-  const canGoMachine = hasGcode;
   const externalMachine = onEnterMachine != null;
+
+  const goMachine = useCallback(() => {
+    if (externalMachine) {
+      onEnterMachine();
+      return;
+    }
+    setStep(2);
+  }, [externalMachine, onEnterMachine]);
+
+  // Auto-advance to machine the moment G-code finishes generating.
+  const prevFetchStatus = useRef(gcodeFetchStatus);
+  useEffect(() => {
+    const prev = prevFetchStatus.current;
+    prevFetchStatus.current = gcodeFetchStatus;
+    if (prev === "loading" && gcodeFetchStatus === "ready") {
+      const id = setTimeout(goMachine, 400);
+      return () => clearTimeout(id);
+    }
+  }, [gcodeFetchStatus, goMachine]);
 
   const downloadLoadedGcode = useCallback(() => {
     const text = exportedGcode.trim();
@@ -47,16 +71,19 @@ export function SendToMachineWizard({
     [],
   );
 
-  const goMachine = () => {
-    if (externalMachine) {
-      onEnterMachine();
-      return;
-    }
-    setStep(2);
-  };
+  const isLoading = gcodeFetchStatus === "loading";
+
+  const generateLabel = isLoading
+    ? "Generating G-code…"
+    : gcodeFetchStatus === "error"
+      ? "Retry — slice & generate G-code"
+      : hasGcode
+        ? "Re-slice & regenerate G-code"
+        : "Slice & generate G-code";
 
   return (
     <div className="space-y-4">
+      {/* Step tabs */}
       {externalMachine ? (
         <div className="flex gap-1 rounded-xl bg-slate-950/80 p-1 ring-1 ring-white/10">
           <div className="flex-1 rounded-lg bg-teal-600 px-2 py-2 text-center text-xs font-medium text-white">
@@ -66,7 +93,8 @@ export function SendToMachineWizard({
           <button
             type="button"
             onClick={goMachine}
-            className="flex-1 rounded-lg px-2 py-2 text-center text-xs font-medium text-slate-400 transition hover:bg-white/5 hover:text-slate-200"
+            disabled={!hasGcode}
+            className="flex-1 rounded-lg px-2 py-2 text-center text-xs font-medium text-slate-400 transition hover:bg-white/5 hover:text-slate-200 disabled:opacity-40"
           >
             <span className="block text-[10px] font-normal opacity-80">Step 2</span>
             Machine
@@ -92,30 +120,63 @@ export function SendToMachineWizard({
         </div>
       )}
 
+      {/* Step 1 — G-code */}
       {(externalMachine || step === 1) && (
-        <section className="rounded-xl border border-white/10 bg-slate-950/60 p-4">
-          <h3 className="text-base font-semibold text-white">Load toolpath into CNCarve</h3>
-          <p className="mt-2 text-sm text-slate-400">
-            In Kiri use <strong className="text-slate-300">Export</strong>, then load that file here
-            (drop or click the area in the box below).
-          </p>
-
-          <div className="mt-4">
-            <GcodeFromKiriPanel onCancelPendingKiriFetch={onCancelPendingKiriFetch} />
+        <section className="space-y-3 rounded-xl border border-white/10 bg-slate-950/60 p-4">
+          <div>
+            <h3 className="text-base font-semibold text-white">Generate G-code</h3>
+            <p className="mt-1 text-sm text-slate-400">
+              One button runs slice, prepare, and export automatically.
+            </p>
           </div>
 
-          {hasGcode && (
+          {/* Primary action */}
+          <button
+            type="button"
+            onClick={onFetchGcodeFromKiri}
+            disabled={isLoading}
+            className={`flex w-full items-center justify-center gap-2 rounded-xl py-3.5 text-sm font-semibold text-white transition
+              ${isLoading ? "cursor-wait bg-slate-700" : gcodeFetchStatus === "error" ? "bg-amber-700 hover:bg-amber-600" : "bg-teal-600 hover:bg-teal-500"}`}
+          >
+            {isLoading && (
+              <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+              </svg>
+            )}
+            {generateLabel}
+          </button>
+
+          {isLoading && (
+            <p className="text-center text-xs text-slate-400">
+              Large meshes can take a minute — watch the status bar below.
+            </p>
+          )}
+
+          {/* G-code ready: show download link */}
+          {hasGcode && !isLoading && (
             <button
               type="button"
               onClick={downloadLoadedGcode}
-              className="mt-3 text-sm font-medium text-teal-400 underline decoration-teal-500/50 underline-offset-2 hover:text-teal-300"
+              className="w-full text-center text-sm font-medium text-teal-400 underline decoration-teal-500/50 underline-offset-2 hover:text-teal-300"
             >
-              Download copy (.nc)
+              Download G-code copy (.nc)
             </button>
           )}
 
-          <details className="mt-4 text-sm text-slate-500">
-            <summary className="cursor-pointer text-slate-400 hover:text-slate-300">
+          {/* Fallback: load from file */}
+          <details className="text-sm">
+            <summary className="cursor-pointer select-none text-slate-400 hover:text-slate-300">
+              Load from file instead (if you exported manually in Kiri)
+            </summary>
+            <div className="mt-3">
+              <GcodeFromKiriPanel onCancelPendingKiriFetch={onCancelPendingKiriFetch} />
+            </div>
+          </details>
+
+          {/* Fallback: paste */}
+          <details className="text-sm">
+            <summary className="cursor-pointer select-none text-slate-400 hover:text-slate-300">
               Paste or edit G-code manually
             </summary>
             <textarea
@@ -127,22 +188,22 @@ export function SendToMachineWizard({
                 setExportedGcode(e.target.value);
               }}
             />
-            <p className="mt-1 text-xs">
-              Use this if you already have G-code in the clipboard or need to tweak a few lines.
-            </p>
           </details>
 
-          <button
-            type="button"
-            disabled={!canGoMachine}
-            onClick={goMachine}
-            className="mt-5 w-full rounded-xl bg-teal-600 py-3 text-sm font-semibold text-white hover:bg-teal-500 disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            Next: machine controls
-          </button>
+          {/* Proceed button — shown when g-code is available but auto-advance didn't fire */}
+          {hasGcode && !isLoading && (
+            <button
+              type="button"
+              onClick={goMachine}
+              className="w-full rounded-xl bg-teal-600 py-3 text-sm font-semibold text-white hover:bg-teal-500"
+            >
+              Go to machine →
+            </button>
+          )}
         </section>
       )}
 
+      {/* Step 2 — Machine (inline, non-external case) */}
       {!externalMachine && step === 2 && (
         <section className="space-y-3">
           <details className="rounded-xl border border-white/10 bg-slate-950/50 text-xs leading-relaxed text-slate-400">
@@ -167,7 +228,7 @@ export function SendToMachineWizard({
             onClick={() => setStep(1)}
             className="w-full rounded-xl border border-white/10 py-2 text-sm text-slate-400 hover:bg-white/5"
           >
-            Back to G-code
+            ← Back to G-code
           </button>
         </section>
       )}

@@ -860,6 +860,8 @@ export function FullWorkspace() {
           <div className="min-h-0 flex-1 overflow-y-auto overflow-x-hidden p-3 [scrollbar-gutter:stable]">
             <SendToMachineWizard
               onCancelPendingKiriFetch={clearGcodeFetchTimeout}
+              onFetchGcodeFromKiri={handleFetchFromKiri}
+              gcodeFetchStatus={gcodeFetchStatus}
               onEnterMachine={() => setCompanionPhase("machine")}
             />
           </div>
