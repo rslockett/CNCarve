@@ -212,7 +212,7 @@ export function outlineSilhouetteExpandMm(
   const tipR = Math.max(0, tip / 2);
   const coneR = Math.min(fluteD / 2, tipR + cutDepthMm * Math.tan(gamma));
 
-  return Math.min(18, Math.max(0.08, coneR + 0.08));
+  return Math.min(18, Math.max(0.08, coneR + 0.18));
 }
 
 /**
@@ -452,6 +452,13 @@ export function mapWizardToKiri(
   );
   const outlineOverKiri = Math.max(0.08, Math.min(0.65, camDerived.outlineOver));
 
+  /**
+   * Choose the contour scan axis that minimises pass count: scan in the longer STL dimension,
+   * step in the shorter one. X-axis scan lines step in Y (px > py → fewer Y steps → X wins).
+   * Falls back to "X" when dimensions are unknown or equal.
+   */
+  const contourAxis: "X" | "Y" = px > 0 || py > 0 ? (py <= px ? "X" : "Y") : "X";
+
   const ops: JsonObject[] = [];
   if (singleBit) {
     ops.push(
@@ -466,12 +473,7 @@ export function mapWizardToKiri(
         ovBotz: outlineOvBotz,
         expandMm: silhouetteExpandMm,
       }),
-      /**
-       * Relief needs **both** X and Y contour passes. Sending only one axis used to grey out the
-       * other Contour toggle in hosted Kiri and Preview/Animate ran outline (Area trace) only.
-       */
-      kiriContourOp({ ...contourBase, axis: "X", inside: true, clipToStock: false }),
-      kiriContourOp({ ...contourBase, axis: "Y", inside: true, clipToStock: false }),
+      kiriContourOp({ ...contourBase, axis: contourAxis, inside: true, clipToStock: false }),
     );
   } else {
     ops.push({
@@ -489,8 +491,7 @@ export function mapWizardToKiri(
       top: false,
     });
     ops.push(
-      kiriContourOp({ ...contourBase, axis: "X", inside: false, clipToStock: true }),
-      kiriContourOp({ ...contourBase, axis: "Y", inside: false, clipToStock: true }),
+      kiriContourOp({ ...contourBase, axis: contourAxis, inside: false, clipToStock: true }),
     );
   }
 
