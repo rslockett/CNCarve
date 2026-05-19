@@ -209,7 +209,7 @@ export function FullWorkspace() {
         ev.origin === KIRI_ORIGIN ||
         ev.origin === "https://www.grid.space";
       if (!fromKiriFrame && !fromKiriOrigin) return;
-      if (fromKiriOrigin) setKiriFrameLoaded(true);
+      if (fromKiriOrigin || fromKiriFrame) setKiriFrameLoaded(true);
       const debug = isKiriDebugEnabled();
       const raw = ev.data;
       if (debug) {

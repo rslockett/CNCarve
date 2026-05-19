@@ -3,15 +3,14 @@
 /**
  * Kiri iframe URL.
  *
- * **Default:** hosted `https://grid.space/kiri/`. That bundle ships the full Kiri runtime
- * (workers, three.js, slicer) and **does honor `op.expand`** on the outline op — confirmed in
- * the cnc-002.nc export where the ~2.2 mm expand we sent showed up in the carved silhouette.
+ * **Default:** `/kiri/` — our own reverse-proxy route that fetches from
+ * `https://grid.space/kiri/` and injects a `SharedArrayBuffer` polyfill into
+ * the HTML before Kiri's init code runs.  Serving Kiri from our origin makes
+ * the iframe same-origin with the parent, which is required for the polyfill
+ * injection and for reliable `postMessage` origin matching.
  *
- * **Why not local?** `vendor/grid-apps/web/` only contains HTML/CSS; the bundled JS lives under
- * `web/lib/` in the upstream build artifact and is not in this repo, so a same-origin `/kiri/`
- * frame would load the UI shell with no engine (Slice/Preview/Animate all silently no-op).
- *
- * **Override:** set `NEXT_PUBLIC_KIRI_URL` to a full URL if you have a custom Kiri build.
+ * **Override:** set `NEXT_PUBLIC_KIRI_URL` to a full URL (e.g. when pointing at
+ * a local Kiri dev server or a custom build).
  */
 function kiriUrlFromEnv(): string {
   const raw =
@@ -21,7 +20,7 @@ function kiriUrlFromEnv(): string {
   if (raw.length > 0) {
     return raw.endsWith("/") ? raw : `${raw}/`;
   }
-  return "https://grid.space/kiri/";
+  return "/kiri/";
 }
 
 /** Iframe `src`. */
