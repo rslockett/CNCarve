@@ -855,8 +855,9 @@ export function SetupWizard({
               <p className="mt-2 leading-relaxed">
                 Each tier sets contour spacing (scallop proxy), slice tolerance, flatness, mesh
                 reduction, and outline step-over. Small patterns get a modest scallop relaxation so
-                Sharper does not over-pass on jewelry-sized work. One-bit mode keeps contour{" "}
-                <strong className="font-medium text-slate-400">Inside only</strong> with{" "}
+                Sharper does not over-pass on jewelry-sized work. One-bit mode runs outline (Area
+                trace) plus <strong className="font-medium text-slate-400">Contour X and Y</strong>{" "}
+                with <strong className="font-medium text-slate-400">Inside only</strong> and{" "}
                 <strong className="font-medium text-slate-400">Clip to stock</strong> off so the
                 stock rectangle does not merge with your silhouette. The embedded Kiri:Moto
                 (grid.space) honors the outline <code className="text-slate-400">expand</code> we

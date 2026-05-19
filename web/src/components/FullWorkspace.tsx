@@ -18,7 +18,6 @@ import {
 } from "@/lib/kiriBridge";
 import { isWebGlLikelyAvailable } from "@/lib/webglCheck";
 import { buildStlForKiri } from "@/lib/stockTransform";
-import { chooseSingleBitContourAxis } from "@/lib/contourAxisChoice";
 import type { WizardAnswers } from "@/lib/presets/types";
 import { isPatternSizeReady, mapWizardToKiri } from "@/lib/wizard";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -629,12 +628,7 @@ export function FullWorkspace() {
       const built = buildStlForKiri(buffer, effectiveAnswers);
       // Always send wizard-scaled STL so Kiri matches requested dimensions.
       const stlForKiri = built.buffer;
-      const payload = mapWizardToKiri(
-        effectiveAnswers,
-        effectiveAnswers.camToolStrategy === "single"
-          ? { singleBitContourAxis: chooseSingleBitContourAxis(built.vertices) }
-          : undefined,
-      );
+      const payload = mapWizardToKiri(effectiveAnswers);
       const ok = importIntoKiri(iframeRef.current, {
         device: payload.device as Record<string, unknown>,
         process: payload.process as Record<string, unknown>,

@@ -376,18 +376,9 @@ function kiriContourOp(args: {
   };
 }
 
-export type MapWizardToKiriOpts = {
-  /**
-   * For single-bit strategy only: contour axis chosen from the scaled mesh (quality vs time).
-   * When omitted, defaults to `"Y"` for backward compatibility.
-   */
-  singleBitContourAxis?: "X" | "Y";
-};
-
 /** Map wizard answers + STL filename into Kiri partial settings */
 export function mapWizardToKiri(
   answers: WizardAnswers,
-  opts?: MapWizardToKiriOpts,
 ): {
   device: JsonObject;
   process: JsonObject;
@@ -428,8 +419,6 @@ export function mapWizardToKiri(
     answers.camToolStrategy === "single" ? singleToolIdNorm : roughToolIdNorm;
 
   const singleBit = answers.camToolStrategy === "single";
-  const singleContourAxis: "X" | "Y" =
-    singleBit && opts?.singleBitContourAxis === "X" ? "X" : "Y";
 
   const f = mat.factor * q.stepScale;
 
@@ -516,12 +505,12 @@ export function mapWizardToKiri(
         ovBotz: outlineOvBotz,
         expandMm: silhouetteExpandMm,
       }),
-      kiriContourOp({
-        ...contourBase,
-        axis: singleContourAxis,
-        inside: true,
-        clipToStock: false,
-      }),
+      /**
+       * Relief needs **both** X and Y contour passes. Sending only one axis used to grey out the
+       * other Contour toggle in hosted Kiri and Preview/Animate ran outline (Area trace) only.
+       */
+      kiriContourOp({ ...contourBase, axis: "X", inside: true, clipToStock: false }),
+      kiriContourOp({ ...contourBase, axis: "Y", inside: true, clipToStock: false }),
     );
   } else {
     ops.push({
@@ -549,8 +538,9 @@ export function mapWizardToKiri(
     camTolerance: contourTolerance,
     camFlatness: contourFlatness,
     camEaseDown: true,
-    camContourXOn: !singleBit || singleContourAxis === "X",
-    camContourYOn: !singleBit || singleContourAxis === "Y",
+    /** Keep both on for single-bit relief — Kiri greys/disables contour when one axis flag is off. */
+    camContourXOn: true,
+    camContourYOn: true,
     camStockClipTo: !singleBit,
     camMillDirection: "climb",
     camZAnchor: "top",
