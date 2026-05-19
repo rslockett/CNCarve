@@ -1238,7 +1238,7 @@ export function RunPanel({
         </div>
       )}
 
-      {connected && hasHomed && (
+      {connected && (
       <div className={p}>
         <p
           className={
