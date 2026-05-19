@@ -92,6 +92,11 @@ export function FullWorkspace() {
   const [wizardOpen, setWizardOpen] = useState(true);
   const [dock, setDock] = useState<null | "send">(null);
   const [importStatus, setImportStatus] = useState<string | null>(null);
+  useEffect(() => {
+    if (!importStatus) return;
+    const id = setTimeout(() => setImportStatus(null), 5_000);
+    return () => clearTimeout(id);
+  }, [importStatus]);
   const [importBusy, setImportBusy] = useState(false);
   /**
    * Most recent widget count reported by Kiri (via `{get:"widgets"}`). Used to detect the
