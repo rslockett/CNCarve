@@ -1176,6 +1176,69 @@ export function RunPanel({
         </div>
       )}
 
+      {connected && !hasHomed && (
+        <div
+          className={
+            compact
+              ? "rounded-lg border border-orange-500/70 bg-orange-950/60 p-2.5 ring-1 ring-orange-500/30"
+              : "rounded-xl border border-orange-500/70 bg-orange-950/60 p-4 ring-1 ring-orange-500/30"
+          }
+        >
+          <p className={compact ? "text-xs font-bold text-orange-200" : "text-sm font-bold text-orange-200"}>
+            Step 1: Home the machine before proceeding
+          </p>
+          <p className={compact ? "mt-1 text-[10px] leading-snug text-orange-300/80" : "mt-1.5 text-xs leading-relaxed text-orange-300/80"}>
+            Drives all axes to their limit switches to establish machine coordinates.
+            Required before jogging, zeroing, or running a job.
+            {!compact && " If GRBL shows Alarm, click Unlock (above) first, then Home."}
+          </p>
+          <button
+            type="button"
+            onClick={machineHome}
+            disabled={streaming}
+            className={
+              compact
+                ? "mt-2 w-full rounded-md bg-orange-500 px-3 py-2 text-xs font-bold text-white shadow-md hover:bg-orange-400 disabled:opacity-40"
+                : "mt-3 w-full rounded-lg bg-orange-500 px-4 py-2.5 text-sm font-bold text-white shadow-md hover:bg-orange-400 disabled:opacity-40"
+            }
+          >
+            {compact ? "Home ($H)" : "Home machine ($H) — required first"}
+          </button>
+          {!compact && (
+            <p className="mt-2 text-[11px] text-orange-400/60">
+              Alarm state? Use <strong className="text-orange-300/80">Unlock ($X)</strong> above, then click Home.
+            </p>
+          )}
+        </div>
+      )}
+
+      {connected && hasHomed && (
+        <div
+          className={
+            compact
+              ? "flex items-center gap-1.5 rounded-md border border-emerald-600/40 bg-emerald-950/40 px-2 py-1"
+              : "flex items-center gap-2 rounded-lg border border-emerald-600/40 bg-emerald-950/40 px-3 py-1.5"
+          }
+        >
+          <span className={compact ? "text-[10px] font-semibold text-emerald-400" : "text-xs font-semibold text-emerald-400"}>
+            Machine homed
+          </span>
+          <span className={compact ? "text-[10px] text-emerald-500/70" : "text-xs text-emerald-500/70"}>
+            — machine coordinates established, work zero will persist across reconnects
+          </span>
+          <button
+            type="button"
+            onClick={machineHome}
+            disabled={streaming}
+            className={compact ? "ml-auto text-[10px] text-emerald-500/60 hover:text-emerald-400 disabled:opacity-40" : "ml-auto text-xs text-emerald-500/60 hover:text-emerald-400 disabled:opacity-40"}
+            title="Re-home if needed"
+          >
+            Re-home
+          </button>
+        </div>
+      )}
+
+      {connected && hasHomed && (
       <div className={p}>
         <p
           className={
@@ -1280,12 +1343,6 @@ export function RunPanel({
             Z down
           </button>
         </div>
-        {connected && !hasHomed && (
-          <p className={compact ? "mt-2 text-[10px] text-amber-400/80" : "mt-3 text-xs text-amber-400/80"}>
-            ⚠ Home the machine first (<strong>Home ($H)</strong> below) so work zero is saved to GRBL EEPROM —
-            required for automatic recovery after a disconnect.
-          </p>
-        )}
         <button
           type="button"
           onClick={zeroWorkpiece}
@@ -1414,7 +1471,9 @@ export function RunPanel({
           </p>
         )}
       </div>
+      )}
 
+      {connected && hasHomed && (
       <div className={p}>
         <p
           className={
@@ -1699,6 +1758,7 @@ export function RunPanel({
           </p>
         )}
       </div>
+      )}
 
       {compact ? (
         <details className="shrink-0 rounded-lg border border-white/10 bg-black/30">
