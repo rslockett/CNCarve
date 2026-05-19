@@ -173,10 +173,10 @@ function reliefOutlineOvBotZ(stockThicknessMm: number, patternDepthMm: number): 
 /**
  * Millimeters of **outside** clearance for the outline trace on tapered tools.
  *
- * Kiri’s outline “expand” field is forwarded into the trace op as **`tr_over`**
- * (see `vendor/.../op-outline.js`): that replaces the default `[fluteØ/2, …]` offset with a
- * single XY offset so the **tip** stays at least the **cone radius at max cut depth** outside the
- * STL shadow (half the envelope diameter at the deepest pass, plus a tiny cushion).
+ * `tr_over` in Kiri = XY offset from part shadow to **tool center**. For a V-bit cutting at
+ * `patternDepthMm`, the cone radius at that depth is `coneR`. Setting `tr_over = coneR + 0.08`
+ * means the cone’s inner edge lands exactly 0.08 mm outside the design boundary — no more eating
+ * into the design, no excessive gap that prevents popping the piece free.
  */
 export function outlineSilhouetteExpandMm(
   machineId: string,
@@ -192,52 +192,15 @@ export function outlineSilhouetteExpandMm(
   const u = metric ? 1 : 25.4;
   const fluteD = Number(tool.flute_diam) * u;
   const fluteL = Number(tool.flute_len) * u;
-  const shaftD = Number(tool.shaft_diam) * u;
   const tip = Number(tool.taper_tip ?? 0) * u;
   if (!(fluteD > 0 && fluteL > 0)) return undefined;
 
   const depthRelief = Math.min(Math.max(0, patternDepthMm), 120);
-  /** Deepest axial engagement along the cone (relief depth + past mesh + small pad for walls). */
   const cutDepthMm = Math.min(
     fluteL,
     depthRelief + OUTLINE_PAST_MESH_MM + OUTLINE_CONE_AXIAL_PAD_MM,
   );
-  /**
-   * Extra radial mm for raised border / “rope” relief so the flank does not clip detail.
-   * (Still capped by `Math.min(18, …)` below.)
-   */
-  const cushionMm = 0.32;
-  const bonus = Number(
-    (tool as { outlineSilhouetteBonusMm?: number }).outlineSilhouetteBonusMm ?? 0,
-  );
-  const b = Number.isFinite(bonus) && bonus >= 0 ? bonus : 0;
-  const fluteR = fluteD / 2;
-  const shaftR = shaftD > 0.01 ? shaftD / 2 : fluteR;
 
-  if (ty === "tapermill") {
-    const radialHalf = Math.max(1e-6, (fluteD - tip) / 2);
-    const gammaFromFlute = Math.atan2(radialHalf, fluteL);
-    const taperHalfDeg = Number(tool.taper_angle);
-    const gammaFromSpec =
-      Number.isFinite(taperHalfDeg) && taperHalfDeg > 0.05 && taperHalfDeg < 89
-        ? (taperHalfDeg * Math.PI) / 180
-        : gammaFromFlute;
-    const gamma = Math.max(gammaFromFlute, gammaFromSpec);
-    const tipR = Math.max(0, tip / 2);
-    const coneR = Math.min(fluteD / 2, tipR + cutDepthMm * Math.tan(gamma));
-    /**
-     * Hosted Kiri uses `tr_over` **instead of** `[fluteØ/2, …]` for outline-style trace offset
-     * (`op-area.js`). So `tr_over` must be ≥ nominal flute radius, not only the cone radius at
-     * depth — otherwise the path sits **inside** the stock silhouette and eats border rope detail.
-     */
-    const shaftClear = Math.max(0, shaftR - coneR) * 0.75;
-    const fromCone = coneR + cushionMm + b + shaftClear;
-    const expand = Math.max(fluteR + 0.06, fromCone);
-    return Math.min(18, Math.max(0.08, expand));
-  }
-
-  const depthBlend = Math.min(1, cutDepthMm / Math.max(fluteL * 0.72, 1e-6));
-  const shaftRing = Math.max(0, (shaftD - fluteD) / 2);
   const radialHalf = Math.max(1e-6, (fluteD - tip) / 2);
   const gammaFromFlute = Math.atan2(radialHalf, fluteL);
   const taperHalfDeg = Number(tool.taper_angle);
@@ -246,16 +209,14 @@ export function outlineSilhouetteExpandMm(
       ? (taperHalfDeg * Math.PI) / 180
       : gammaFromFlute;
   const gamma = Math.max(gammaFromFlute, gammaFromSpec);
-  const ballTipR = Math.max(0, tip / 2);
-  const coneR = Math.min(fluteD / 2, ballTipR + cutDepthMm * Math.tan(gamma));
-  const shaftClear = Math.max(0, shaftR - coneR) * 0.75;
-  const fromCone = coneR + cushionMm + shaftRing * depthBlend + b + shaftClear;
-  const expand = Math.max(fluteR + 0.06, fromCone);
-  return Math.min(18, Math.max(0.08, expand));
+  const tipR = Math.max(0, tip / 2);
+  const coneR = Math.min(fluteD / 2, tipR + cutDepthMm * Math.tan(gamma));
+
+  return Math.min(18, Math.max(0.08, coneR + 0.08));
 }
 
 /**
- * Kiri:Moto CAM (from grid-apps / docs), mapped from wizard “Quality”:
+ * Kiri:Moto CAM (from grid-apps / docs), mapped from wizard "Quality":
  * - **Precision** (`camTolerance` / op `tolerance`) — mm chordal resolution for mesh slices;
  *   lower = follows STL facets tighter, more toolpath points, slower.
  * - **Flatness** (`camFlatness` / op `flatness`) — how closely parallel passes hug local surface

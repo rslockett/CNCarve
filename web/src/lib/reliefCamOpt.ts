@@ -18,10 +18,10 @@ export type ReliefCamQualityId = "fast" | "balanced" | "fine" | "replica";
  * relief. **Showpiece (`replica`)** stays the tightest tier for when time is secondary.
  */
 const TARGET_CUSP_MM: Record<ReliefCamQualityId, number> = {
-  fast: 0.125,
-  balanced: 0.1,
-  fine: 0.072,
-  replica: 0.034,
+  fast: 0.070,
+  balanced: 0.056,
+  fine: 0.040,
+  replica: 0.019,
 };
 
 /**
