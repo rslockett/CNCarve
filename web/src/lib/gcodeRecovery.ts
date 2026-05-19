@@ -156,41 +156,45 @@ export function scanGcodeModalState(lines: string[], upToIndex: number): GcodeMo
 }
 
 /**
- * Build a UGS-style resume preamble:
- *   1. Restore modal state (units, distance mode, feed mode, WCS, plane)
- *   2. Retract to safe Z (highest Z seen + clearance)
- *   3. Rapid to resume XY
- *   4. Restart spindle (if was on)
- *   5. Plunge to working Z at the recorded feed rate
+ * Build a safe resume preamble for post-homing recovery.
  *
- * Returns an array of G-code lines to send via sendCommand() before streaming from line N.
- * Units are whatever the scanned G-code uses (G21 = mm, G20 = inches).
+ * After $H the machine is at the homed position (Z at maximum travel = physically highest point).
+ * The sequence here keeps Z at that elevated home height while moving XY over the resume point,
+ * THEN descends to safe clearance height, THEN starts the spindle, THEN plunges. This prevents
+ * the bit from clipping any clamps or hold-downs during the lateral transit.
+ *
+ * Order:
+ *   1. Modal state (units, G90, feed mode, WCS, plane) — no motion
+ *   2. G0 XY → rapid to resume XY at full homed Z height (bit is as high as it can go)
+ *   3. G0 Z{safeZ} → descend to safe clearance above stock (still clear of workpiece)
+ *   4. M3/M4 S{rpm} + G4 P2 → start spindle, wait 2 s for spin-up
+ *   5. G1 Z{z} F{feed} → plunge to cutting depth at controlled feed rate
  */
 export function buildResumePreamble(state: GcodeModalState, zClearanceMm = 4): string[] {
   const clearance = state.units === "G20" ? zClearanceMm / 25.4 : zClearanceMm;
   const safeZ = (state.maxZ + clearance).toFixed(3);
   const preamble: string[] = [];
 
-  // Modal restoration
+  // Modal restoration — no motion
   preamble.push(state.units);
-  preamble.push("G90"); // always absolute — safest regardless of what was active
+  preamble.push("G90");
   preamble.push(state.feedMode);
   preamble.push(state.wcs);
   preamble.push(state.plane);
 
-  // Safe retract
-  preamble.push(`G0 Z${safeZ}`);
-
-  // Rapid to resume XY
+  // XY transit at homed Z height (bit is at ceiling — can't hit any clamp)
   preamble.push(`G0 X${state.x.toFixed(3)} Y${state.y.toFixed(3)}`);
 
-  // Restart spindle if it was on, give it a moment to spin up
+  // Descend to safe clearance above stock
+  preamble.push(`G0 Z${safeZ}`);
+
+  // Start spindle only after the bit is over the right spot, not while transiting
   if (state.spindleMode !== null && state.rpm > 0) {
     preamble.push(`${state.spindleMode} S${Math.round(state.rpm)}`);
     preamble.push("G4 P2");
   }
 
-  // Plunge to working depth at recorded feed rate
+  // Plunge at controlled feed rate
   const fPart = state.feedRate > 0 ? ` F${state.feedRate.toFixed(1)}` : "";
   preamble.push(`G1 Z${state.z.toFixed(3)}${fPart}`);
 
