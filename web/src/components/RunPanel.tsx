@@ -11,6 +11,13 @@ import {
   reportGcodeSanitization,
   type GrblDiagnostic,
 } from "@/lib/grblSerial";
+import {
+  buildResumePreamble,
+  clearJobState,
+  loadJobState,
+  saveJobState,
+  scanGcodeModalState,
+} from "@/lib/gcodeRecovery";
 import { getMachineOrDefault } from "@/lib/wizard";
 import { flushSync } from "react-dom";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -200,6 +207,14 @@ export function RunPanel({
   }, []);
 
   const [streamHeartbeatMs, setStreamHeartbeatMs] = useState(14_000);
+  /** True after a successful $H home cycle this session — required for EEPROM-based WCS recovery. */
+  const [hasHomed, setHasHomed] = useState(false);
+  /** Non-null when the loaded G-code matches a saved mid-job state (USB drop recovery). */
+  const [savedRecovery, setSavedRecovery] = useState<{
+    lineIndex: number;
+    lineCount: number;
+  } | null>(null);
+  const [recovering, setRecovering] = useState(false);
   useEffect(() => {
     setStreamHeartbeatMs(readStreamHeartbeatMs());
   }, [readStreamHeartbeatMs]);
@@ -298,6 +313,16 @@ export function RunPanel({
     };
   }, [streaming]);
 
+  /** Check for a saved job state whenever G-code changes (e.g. after Kiri export). */
+  useEffect(() => {
+    if (!exportedGcode.trim()) {
+      setSavedRecovery(null);
+      return;
+    }
+    const saved = loadJobState(exportedGcode);
+    setSavedRecovery(saved);
+  }, [exportedGcode]);
+
   const supported =
     typeof navigator !== "undefined" && !!navigator.serial;
 
@@ -340,6 +365,7 @@ export function RunPanel({
       }
       if (ev.kind === "disconnect") {
         setStallInfo(null);
+        setHasHomed(false);
         /**
          * Only shout when it's a SURPRISE drop. Clean closes during a Disconnect-button click
          * (reader.cancel, writer.close, port.close) all emit disconnect events with
@@ -347,6 +373,15 @@ export function RunPanel({
          */
         if (!ev.intentional) {
           const wasStreamingFile = streamActiveRef.current;
+          /** Persist line index so the user can recover after rehoming. */
+          if (wasStreamingFile) {
+            const lastAck = lastAckedIndexRef.current;
+            if (lastAck !== null && lastAck >= 0 && exportedGcode.trim()) {
+              const total = parseGrblGcodeLines(exportedGcode).length;
+              saveJobState(exportedGcode, lastAck + 1, total);
+              setSavedRecovery({ lineIndex: lastAck + 1, lineCount: total });
+            }
+          }
           setStreaming(false);
           streamActiveRef.current = false;
           void releaseStreamWakeLock();
@@ -487,8 +522,10 @@ export function RunPanel({
     if (!connected || streaming) return;
     setLastError(null);
     try {
+      appendSerialLog("--- Homing cycle $H started (driving to limit switches) ---");
       await serialRef.current.sendCommand("$H", HOMING_TIMEOUT_MS);
-      appendSerialLog("(Homing cycle $H complete)");
+      appendSerialLog("--- Homing complete — machine coordinates established; G54 work offset restored from EEPROM ---");
+      setHasHomed(true);
     } catch (e) {
       setLastError(e instanceof Error ? e.message : String(e));
     }
@@ -544,7 +581,7 @@ export function RunPanel({
   };
 
   /** Shared run + resume body. {@param startIndex} is 0-based into stripped lines. */
-  const streamFromIndex = async (startIndex: number) => {
+  const streamFromIndex = async (startIndex: number, { skipBuiltinPreamble = false } = {}) => {
     setLastError(null);
     setJobResumeAtIndex(null);
     setSpindleSafetyBlocker(null);
@@ -618,7 +655,7 @@ export function RunPanel({
      * / lost steps after the stop). The next line may still move in X/Y/Z per the file; at least
      * Z is usually a bit higher first so a buried bit is less likely to drag sideways in the cut.
      */
-    if (startIndex > 0) {
+    if (startIndex > 0 && !skipBuiltinPreamble) {
       appendSerialLog(
         `--- Resume job from line ${startIndex + 1}/${total} ` +
           `(preamble: G91 Z+${RESUME_RELATIVE_Z_CLEAR_MM} mm lift only — X/Y unchanged) ---`,
@@ -657,6 +694,9 @@ export function RunPanel({
         (i, t) => {
           lastAckedIndexRef.current = i - 1;
           setStreamProgress({ i, total: t });
+          if (i % 50 === 0 && exportedGcode.trim()) {
+            saveJobState(exportedGcode, i, t);
+          }
           if (i % 100 === 0 || i === t) {
             appendSerialLog(`Stream ${i}/${t}`);
           }
@@ -669,6 +709,8 @@ export function RunPanel({
         },
       );
       appendSerialLog("--- Stream finished ---");
+      clearJobState();
+      setSavedRecovery(null);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       setLastError(msg);
@@ -733,6 +775,47 @@ export function RunPanel({
   const resumeJob = async () => {
     if (!exportedGcode.trim() || jobResumeAtIndex === null) return;
     await streamFromIndex(jobResumeAtIndex);
+  };
+
+  /**
+   * Full USB-drop recovery:
+   *  1. $H — drives machine to limit switches, establishing machine coords;
+   *     G54 WCS survives in GRBL EEPROM so work origin is restored automatically.
+   *  2. Scan G-code 0..N-1 to reconstruct modal state (units, WCS, feed rate, spindle, position).
+   *  3. Send UGS-style preamble: modal codes → safe-Z retract → XY rapid → spindle on → Z plunge.
+   *  4. Stream G-code from line N without any additional preamble.
+   */
+  const recoverJob = async () => {
+    if (!exportedGcode.trim() || savedRecovery === null || !connected) return;
+    setRecovering(true);
+    setLastError(null);
+    try {
+      appendSerialLog("--- Recovery: $H — driving to limit switches to restore machine coordinates ---");
+      await serialRef.current.sendCommand("$H", HOMING_TIMEOUT_MS);
+      appendSerialLog("--- Recovery: homing done; G54 work offset restored from EEPROM ---");
+      setHasHomed(true);
+
+      const lines = parseGrblGcodeLines(exportedGcode);
+      const resumeIdx = Math.min(savedRecovery.lineIndex, lines.length - 1);
+      const modalState = scanGcodeModalState(lines, resumeIdx);
+      const preamble = buildResumePreamble(modalState);
+
+      appendSerialLog(
+        `--- Recovery preamble: ${preamble.length} lines to position tool at resume point (line ${resumeIdx + 1}/${lines.length}) ---`,
+      );
+      for (const cmd of preamble) {
+        await serialRef.current.sendCommand(cmd, 60_000);
+      }
+      appendSerialLog("--- Recovery preamble done — resuming stream ---");
+
+      setSavedRecovery(null);
+      clearJobState();
+      await streamFromIndex(resumeIdx, { skipBuiltinPreamble: true });
+    } catch (e) {
+      setLastError(`Recovery failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setRecovering(false);
+    }
   };
 
   const strippedLineCount = useMemo(
@@ -977,6 +1060,57 @@ export function RunPanel({
         )}
       </div>
 
+      {connected && savedRecovery !== null && (
+        <div
+          className={
+            compact
+              ? "rounded-lg border border-amber-500/60 bg-amber-950/70 p-2 ring-1 ring-amber-500/30"
+              : "rounded-xl border border-amber-500/60 bg-amber-950/70 p-4 ring-1 ring-amber-500/30"
+          }
+        >
+          <p className={compact ? "text-xs font-semibold text-amber-200" : "text-sm font-semibold text-amber-200"}>
+            Job interrupted — USB disconnect detected
+          </p>
+          <p className={compact ? "mt-1 text-[10px] leading-snug text-amber-300/80" : "mt-1 text-xs leading-relaxed text-amber-300/80"}>
+            Stopped at line <strong className="text-amber-100">{savedRecovery.lineIndex}</strong> of{" "}
+            <strong className="text-amber-100">{savedRecovery.lineCount}</strong>. Click{" "}
+            <strong className="text-amber-100">Recover job</strong> to home the machine, restore work coordinates,
+            and resume cutting from where it left off.
+          </p>
+          {!compact && (
+            <p className="mt-1.5 text-[11px] text-amber-400/70">
+              Requires limit switches. Homing restores G54 work offset from EEPROM — no manual re-zeroing needed.
+            </p>
+          )}
+          <div className={`flex flex-wrap gap-2 ${compact ? "mt-2" : "mt-3"}`}>
+            <button
+              type="button"
+              onClick={recoverJob}
+              disabled={streaming || recovering}
+              className={
+                compact
+                  ? "rounded-md bg-amber-500 px-3 py-1.5 text-[11px] font-semibold text-black hover:bg-amber-400 disabled:opacity-40"
+                  : "rounded-lg bg-amber-500 px-4 py-2 text-sm font-semibold text-black hover:bg-amber-400 disabled:opacity-40"
+              }
+            >
+              {recovering ? "Recovering…" : "Recover job ($H + resume)"}
+            </button>
+            <button
+              type="button"
+              onClick={() => { setSavedRecovery(null); clearJobState(); }}
+              disabled={streaming || recovering}
+              className={
+                compact
+                  ? "rounded-md border border-amber-500/50 bg-transparent px-2 py-1.5 text-[11px] font-semibold text-amber-200 hover:bg-amber-900/40 disabled:opacity-40"
+                  : "rounded-lg border border-amber-500/50 bg-transparent px-3 py-2 text-sm font-semibold text-amber-200 hover:bg-amber-900/40 disabled:opacity-40"
+              }
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
+
       {connected && (
         <div className={p}>
           <p
@@ -1146,6 +1280,12 @@ export function RunPanel({
             Z down
           </button>
         </div>
+        {connected && !hasHomed && (
+          <p className={compact ? "mt-2 text-[10px] text-amber-400/80" : "mt-3 text-xs text-amber-400/80"}>
+            ⚠ Home the machine first (<strong>Home ($H)</strong> below) so work zero is saved to GRBL EEPROM —
+            required for automatic recovery after a disconnect.
+          </p>
+        )}
         <button
           type="button"
           onClick={zeroWorkpiece}
