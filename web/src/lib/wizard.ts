@@ -52,30 +52,42 @@ const MATERIALS: Record<
  * `reliefCamOpt.ts` (scallop proxy × tool Ø); **tolerance / flatness** stay explicit per tier there
  * (Kiri uses tolerance as XY slice pitch — must not track coarse step or previews voxelize).
  */
+/**
+ * stepScale drives all feed rates (rough, outline, contour, rapids) and spindle RPM.
+ * Lower → slower cuts, shallower passes, more careful overall. The contour pass count
+ * is set by the cusp-height target in reliefCamOpt.ts (independent of stepScale).
+ *
+ * Hardwood (factor 0.65) contour speeds at each tier:
+ *   fast ~430mm/min · balanced ~335mm/min · fine ~205mm/min · replica ~150mm/min
+ *
+ * Expected runtime for 3"×3" (76mm) hardwood, single-axis Y contour only:
+ *   fast ~10min · balanced ~16min · fine ~33min · replica ~63min
+ * Both-axis on a 6"×6" piece scales to roughly 2.2hr / 3.4hr / 8.8hr / 17hr respectively.
+ */
 const QUALITY = {
   fast: {
-    stepScale: 1.58,
-    label: "Quick — fastest, light ridges",
-    outlineDownMul: 1.26,
+    stepScale: 0.92,
+    label: "Quick — fastest, visible ridges",
+    outlineDownMul: 1.15,
     contourFeedMul: 1.04,
   },
   balanced: {
-    stepScale: 1.22,
-    label: "Balanced — everyday default",
-    outlineDownMul: 1.16,
+    stepScale: 0.72,
+    label: "Balanced — good quality, everyday default",
+    outlineDownMul: 1.05,
     contourFeedMul: 1.02,
   },
   fine: {
-    stepScale: 1.14,
-    label: "Sharper — finer detail",
-    outlineDownMul: 1.14,
-    contourFeedMul: 1.04,
+    stepScale: 0.50,
+    label: "Sharper — fine detail, ~2× balanced time",
+    outlineDownMul: 0.95,
+    contourFeedMul: 0.90,
   },
   replica: {
-    stepScale: 0.98,
-    label: "Showpiece — slowest, tightest",
-    outlineDownMul: 0.98,
-    contourFeedMul: 0.92,
+    stepScale: 0.36,
+    label: "Showpiece — maximum quality, ~4× balanced time",
+    outlineDownMul: 0.84,
+    contourFeedMul: 0.82,
   },
 } as const;
 
@@ -465,7 +477,10 @@ export function mapWizardToKiri(
 
   const roughSpeed = Math.round(800 * f);
   const outlineSpeed = Math.round(650 * f);
-  const spindle = Math.min(preset.spindleMaxRpm, Math.round(9000 * f));
+  const spindle = Math.min(
+    preset.spindleMaxRpm,
+    Math.max(Math.round(preset.spindleMaxRpm * 0.85), Math.round(9000 * f)),
+  );
   const contourSpeed = Math.min(
     2500,
     Math.max(
