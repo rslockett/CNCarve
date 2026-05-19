@@ -54,9 +54,9 @@ const MATERIALS: Record<
  */
 const QUALITY = {
   fast: {
-    stepScale: 1.58,
+    stepScale: 1.30,
     label: "Quick — fastest, light ridges",
-    outlineDownMul: 1.26,
+    outlineDownMul: 1.20,
     contourFeedMul: 1.04,
   },
   balanced: {
