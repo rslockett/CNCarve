@@ -18,7 +18,6 @@ import {
 } from "@/lib/kiriBridge";
 import { isWebGlLikelyAvailable } from "@/lib/webglCheck";
 import { buildStlForKiri } from "@/lib/stockTransform";
-import { chooseSingleBitContourAxis } from "@/lib/contourAxisChoice";
 import type { WizardAnswers } from "@/lib/presets/types";
 import { isPatternSizeReady, mapWizardToKiri } from "@/lib/wizard";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -50,16 +49,6 @@ const KIRI_EXPORT_FIRST_FALLBACK_MS = 180_000;
 const KIRI_SLICE_PHASE_FALLBACK_MS = 240_000;
 /** After cancel, let Kiri’s worker settle before slice (ms). */
 const KIRI_CANCEL_BEFORE_SLICE_MS = 600;
-
-function formatSyncElapsed(totalSec: number): string {
-  const s = Math.max(0, Math.floor(totalSec));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = s % 60;
-  if (h > 0) return `${h}h ${m}m ${sec}s`;
-  if (m > 0) return `${m}m ${sec}s`;
-  return `${sec}s`;
-}
 
 /**
  * Kiri’s left column (tabs / stock / limits / …) sits in the iframe; we can’t read its width
@@ -173,39 +162,6 @@ export function FullWorkspace() {
     setGcodeFetchStatus("ready");
   }, [exportedGcode]);
 
-  /** While Kiri is generating G-code, refresh status so long runs don’t look frozen. */
-  useEffect(() => {
-    if (gcodeFetchStatus !== "loading" || !expectingKiriGcodeRef.current) {
-      return;
-    }
-    const tick = () => {
-      if (!expectingKiriGcodeRef.current) return;
-      const elapsedSec = (Date.now() - kiriSyncStartedAtRef.current) / 1000;
-      const phase = kiriExportPipelineRef.current;
-      const elapsed = formatSyncElapsed(elapsedSec);
-      if (phase === "export_quick") {
-        setImportStatus(
-          `Kiri: exporting G-code (same as Export after Preview)… Elapsed ${elapsed}. If you already previewed in Kiri, this is often ~1–2 minutes.`,
-        );
-      } else if (phase === "slice") {
-        setImportStatus(
-          `Kiri: slicing / preview… Elapsed ${elapsed}. Full recompute — can take a few minutes on big meshes.`,
-        );
-      } else if (phase === "prepare") {
-        setImportStatus(
-          `Kiri: preparing toolpaths… Elapsed ${elapsed}.`,
-        );
-      } else if (phase === "export") {
-        setImportStatus(
-          `Kiri: writing G-code… Elapsed ${elapsed}. Usually a few minutes; very large programs can take longer.`,
-        );
-      }
-    };
-    tick();
-    const id = window.setInterval(tick, 12_000);
-    return () => window.clearInterval(id);
-  }, [gcodeFetchStatus]);
-
   useEffect(() => {
     function onMsg(ev: MessageEvent) {
       const fromKiriFrame = iframeRef.current?.contentWindow === ev.source;
@@ -250,9 +206,7 @@ export function FullWorkspace() {
         setKiriWidgetCount(count);
         if (count > 0) {
           setImportBusy(false);
-          setImportStatus(
-            `Model loaded in Kiri (${count} mesh${count === 1 ? "" : "es"}). Click PREVIEW in Kiri's top bar to see the carve, then ANIMATE.`,
-          );
+          setImportStatus(null);
           if (debug) {
             console.info("[CNCarve] Kiri widget check confirmed import.", {
               count,
@@ -305,7 +259,6 @@ export function FullWorkspace() {
             slicePhaseFallbackRef.current = null;
           }
           kiriExportPipelineRef.current = "prepare";
-          setImportStatus("Kiri slice/preview finished — preparing toolpaths…");
           requestKiriPrepare(iframeRef.current);
           preparePhaseFallbackRef.current = window.setTimeout(() => {
             preparePhaseFallbackRef.current = null;
@@ -321,9 +274,6 @@ export function FullWorkspace() {
               );
             }
             kiriExportPipelineRef.current = "export";
-            setImportStatus(
-              "Prepare callback missing — generating G-code (fallback)…",
-            );
             requestKiriExport(iframeRef.current);
           }, 180_000);
         }
@@ -337,7 +287,6 @@ export function FullWorkspace() {
             preparePhaseFallbackRef.current = null;
           }
           kiriExportPipelineRef.current = "export";
-          setImportStatus("Kiri prepare finished — generating G-code…");
           requestKiriExport(iframeRef.current);
         }
         if (evName === "export.done" && expectingKiriGcodeRef.current) {
@@ -354,13 +303,13 @@ export function FullWorkspace() {
           if (gcode.length > 0) {
             setExportedGcode(gcode);
             setGcodeFetchStatus("ready");
-            setImportStatus("G-code ready — continue in Send to machine.");
+            setImportStatus(null);
             setCompanionPhase("gcode");
             setDock("send");
           } else {
             setGcodeFetchStatus("error");
-            setImportStatus(
-              "Kiri returned empty G-code — run Preview in Kiri, then try Load again or paste G-code.",
+            console.warn(
+              "[CNCarve] Kiri returned empty G-code — run Preview in Kiri, then try Load again or paste G-code.",
             );
           }
         }
@@ -373,10 +322,10 @@ export function FullWorkspace() {
             d.data != null && typeof d.data === "string"
               ? d.data
               : "";
-          setImportStatus(
+          console.warn(
             detail
-              ? `Kiri reported ${evName}: ${detail}`
-              : `Kiri reported ${evName} — check the browser console (F12) for details.`,
+              ? `[CNCarve] Kiri reported ${evName}: ${detail}`
+              : `[CNCarve] Kiri reported ${evName} — see browser console (F12).`,
           );
         }
       }
@@ -390,10 +339,7 @@ export function FullWorkspace() {
     function onMsgErr() {
       if (!expectingKiriGcodeRef.current) return;
       console.warn(
-        "[CNCarve] messageerror while waiting for Kiri — payload may be too large for iframe postMessage, or the message was invalid.",
-      );
-      setImportStatus(
-        "The browser could not take G-code from Kiri through the iframe bridge (common with very large programs). In Kiri use Export → save the file → drop it into Send to machine → Fallback.",
+        "[CNCarve] Could not take G-code from Kiri through the iframe bridge (common with very large programs). Use Export in Kiri → drop the file into Companion.",
       );
     }
     window.addEventListener("messageerror", onMsgErr);
@@ -402,7 +348,7 @@ export function FullWorkspace() {
 
   const handleFetchFromKiri = useCallback(() => {
     if (!isKiriIframeReady(iframeRef.current)) {
-      setImportStatus("Kiri’s iframe isn’t ready — wait for the CAM view to load.");
+      console.warn("[CNCarve] Kiri’s iframe isn’t ready — wait for the CAM view to load.");
       return;
     }
     clearGcodeFetchTimeout();
@@ -438,7 +384,6 @@ export function FullWorkspace() {
           );
         }
         kiriExportPipelineRef.current = "export";
-        setImportStatus("Kiri: generating G-code…");
         requestKiriExport(iframeRef.current);
       }, 180_000);
     };
@@ -451,9 +396,11 @@ export function FullWorkspace() {
       gcodeFetchAttemptsRef.current += 1;
       kiriExportPipelineRef.current = "slice";
       requestKiriSlice(iframeRef.current);
-      setImportStatus(
-        `Still stuck on slice — restarting slice (attempt ${gcodeFetchAttemptsRef.current}/3).`,
-      );
+      if (isKiriDebugEnabled()) {
+        console.info(
+          `[CNCarve] Still stuck on slice — restarting slice (attempt ${gcodeFetchAttemptsRef.current}/3).`,
+        );
+      }
       gcodeFetchRetryRef.current = window.setTimeout(retryPipeline, 120_000);
     };
 
@@ -472,9 +419,6 @@ export function FullWorkspace() {
           );
         }
         kiriExportPipelineRef.current = "prepare";
-        setImportStatus(
-          "Slice/preview callback missing — preparing toolpaths (fallback)…",
-        );
         requestKiriPrepare(iframeRef.current);
         scheduleExportFallbackAfterPrepare();
       }, KIRI_SLICE_PHASE_FALLBACK_MS);
@@ -487,9 +431,6 @@ export function FullWorkspace() {
         exportQuickFallbackRef.current = null;
       }
       kiriExportPipelineRef.current = "slice";
-      setImportStatus(
-        "Stopping in-flight Kiri work, then slice → prepare → export (avoids overlapping export + slice).",
-      );
       requestKiriCancel(iframeRef.current);
       window.setTimeout(() => {
         if (
@@ -498,15 +439,12 @@ export function FullWorkspace() {
         ) {
           return;
         }
-        setImportStatus(
-          "Kiri: slicing / preview… (then prepare → G-code). Large meshes can take several minutes.",
-        );
         const okSlice = requestKiriSlice(iframeRef.current);
         if (!okSlice) {
           expectingKiriGcodeRef.current = false;
           kiriExportPipelineRef.current = "idle";
           setGcodeFetchStatus("error");
-          setImportStatus("Could not reach Kiri — try again.");
+          console.warn("[CNCarve] Could not reach Kiri — try again.");
           return;
         }
         attachFullSlicePipelineTimers();
@@ -520,13 +458,10 @@ export function FullWorkspace() {
       expectingKiriGcodeRef.current = false;
       kiriExportPipelineRef.current = "idle";
       setGcodeFetchStatus("error");
-      setImportStatus("Could not reach Kiri — try again.");
+      console.warn("[CNCarve] Could not reach Kiri — try again.");
       return;
     }
     gcodeFetchAttemptsRef.current = 1;
-    setImportStatus(
-      "Kiri: exporting G-code (like Export after Preview). If you already ran Preview, this is usually ~1–2 minutes.",
-    );
 
     exportQuickFallbackRef.current = window.setTimeout(() => {
       exportQuickFallbackRef.current = null;
@@ -547,8 +482,8 @@ export function FullWorkspace() {
     gcodeFetchTimeoutRef.current = window.setTimeout(() => {
       gcodeFetchTimeoutRef.current = null;
       setGcodeFetchStatus((s) => (s === "loading" ? "error" : s));
-      setImportStatus(
-        "Timed out waiting for Kiri G-code over the iframe bridge. Reference: https://github.com/GridSpace/grid-apps/blob/master/src/kiri/run/frame.js — or use Export in Kiri → drop file.",
+      console.warn(
+        "[CNCarve] Timed out waiting for Kiri G-code over the iframe bridge — use Export in Kiri → drop file into Companion.",
       );
       clearGcodeFetchTimeout();
     }, KIRI_SYNC_MAX_WAIT_MS);
@@ -610,9 +545,7 @@ export function FullWorkspace() {
     setKiriIframeKey((k) => k + 1);
     setKiriFrameLoaded(false);
     setImportBusy(false);
-    setImportStatus(
-      "Restarting Kiri — wait until the grid/3D view shows in the background, then tap Import again. If the view stays black, reload the whole page.",
-    );
+    setImportStatus(null);
   }, [clearGcodeFetchTimeout]);
 
   const openSetup = useCallback(() => {
@@ -623,6 +556,7 @@ export function FullWorkspace() {
     clearGcodeFetchTimeout();
     setGcodeFetchStatus((s) => (s === "loading" ? "idle" : s));
     setImportBusy(false);
+    setImportStatus(null);
     setWizardOpen(true);
   }, [clearGcodeFetchTimeout]);
 
@@ -634,6 +568,7 @@ export function FullWorkspace() {
     clearGcodeFetchTimeout();
     setGcodeFetchStatus((s) => (s === "loading" ? "idle" : s));
     setImportBusy(false);
+    setImportStatus(null);
     setWizardOpen(false);
     setCompanionPhase("gcode");
     setGcodePanelPos(getDefaultGcodeCompanionPos());
@@ -648,6 +583,7 @@ export function FullWorkspace() {
     clearGcodeFetchTimeout();
     setGcodeFetchStatus((s) => (s === "loading" ? "idle" : s));
     setImportBusy(false);
+    setImportStatus(null);
     setWizardOpen(false);
     setCompanionPhase("gcode");
     setGcodePanelPos(getDefaultGcodeCompanionPos());
@@ -691,20 +627,13 @@ export function FullWorkspace() {
     setGcodeFetchStatus((s) => (s === "loading" ? "idle" : s));
     setImportBusy(true);
     setKiriWidgetCount(null);
-    setImportStatus(
-      "Sending to Kiri… this can take several seconds on first load; the button will unlock when the model is loaded or if something fails.",
-    );
+    setImportStatus(null);
     try {
       // Validates binary STL, pattern size, and scaling math.
       const built = buildStlForKiri(buffer, effectiveAnswers);
       // Always send wizard-scaled STL so Kiri matches requested dimensions.
       const stlForKiri = built.buffer;
-      const payload = mapWizardToKiri(
-        effectiveAnswers,
-        effectiveAnswers.camToolStrategy === "single"
-          ? { singleBitContourAxis: chooseSingleBitContourAxis(built.vertices) }
-          : undefined,
-      );
+      const payload = mapWizardToKiri(effectiveAnswers);
       const ok = importIntoKiri(iframeRef.current, {
         device: payload.device as Record<string, unknown>,
         process: payload.process as Record<string, unknown>,
@@ -717,28 +646,16 @@ export function FullWorkspace() {
         return;
       }
       setWizardOpen(false);
+      setImportStatus(null);
       setCompanionPhase("gcode");
       setGcodePanelPos(getDefaultGcodeCompanionPos());
       setDock("send");
-      const stockNote =
-        effectiveAnswers.displayUnits === "in"
-          ? " Note: Kiri may display values in inches or millimeters depending on its local UI mode."
-          : "";
-      setImportStatus(
-        `Sending wizard-scaled STL to Kiri — you should see the mesh in a few seconds. Machine companion is open so you can export/load G-code next.${stockNote}`,
-      );
       importWatchdogRef.current = window.setTimeout(() => {
         importWatchdogRef.current = null;
         setImportBusy(false);
-        /**
-         * Hard fail-loud: if after 15s Kiri still hasn't reported any widgets, the STL did NOT
-         * make it into Kiri (most often a silent `fetch(dataUrl)` failure on the iframe side).
-         * Without this the user thinks everything worked, clicks Animate, and sees a bit
-         * moving over an UNCARVED stock — that is the exact symptom they're reporting.
-         */
-        if ((kiriWidgetCountRef.current ?? 0) === 0) {
-          setImportStatus(
-            "Kiri did not load the STL (no model showed up in the platform). Try: 1) refresh this page, 2) click Restart Kiri in the companion, 3) run Setup again. If it keeps happening, open the browser console (F12) and look for [CNCarve] / [Kiri] errors.",
+        if ((kiriWidgetCountRef.current ?? 0) === 0 && isKiriDebugEnabled()) {
+          console.warn(
+            "[CNCarve] Import watchdog: no Kiri widgets reported after 15s (model may still have loaded — check the 3D view).",
           );
         }
       }, 15_000);
@@ -785,22 +702,6 @@ export function FullWorkspace() {
         </div>
       </div>
 
-      {!wizardOpen && importStatus && (
-        <div
-          className="pointer-events-auto absolute bottom-16 left-1/2 z-30 w-[min(92vw,28rem)] -translate-x-1/2 rounded-xl border border-white/15 bg-slate-900/95 px-4 py-3 text-center text-sm text-slate-200 shadow-xl backdrop-blur-md md:bottom-6"
-          role="status"
-        >
-          {importStatus}
-          <button
-            type="button"
-            className="ml-2 text-xs text-teal-400 underline hover:text-teal-300"
-            onClick={() => setImportStatus(null)}
-          >
-            Dismiss
-          </button>
-        </div>
-      )}
-
       {!wizardOpen && (
         <button
           type="button"
@@ -813,7 +714,10 @@ export function FullWorkspace() {
 
       <SetupWizard
         open={wizardOpen}
-        onDismiss={() => setWizardOpen(false)}
+        onDismiss={() => {
+          setWizardOpen(false);
+          setImportStatus(null);
+        }}
         onImportToKiri={handleImportToKiri}
         onSkipToMachine={skipToMachineFromSetup}
         importStatus={importStatus}

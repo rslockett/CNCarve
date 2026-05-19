@@ -8,27 +8,82 @@ import type { WizardAnswers } from "./presets/types";
 
 export type PatternSize = { x: number; y: number; z: number };
 
+type ReliefAxis = "x" | "y" | "z";
+
 /**
- * Top-down footprint on the stock for diagrams and auto-fit: use the **two largest**
- * bounding-box edges as the table shadow, treating the **smallest** as the relief
- * thickness axis. This matches tall meshes (long axis in STL Z) better than raw X×Y.
+ * STL axis treated as **carve depth** (smallest bbox edge). Tie-break prefers Z, then Y, then X
+ * so flat relief exports (thin Z) map to stock thickness as users expect.
+ */
+export function reliefThicknessAxis(box: PatternSize): ReliefAxis {
+  const ranked: { ax: ReliefAxis; v: number }[] = [
+    { ax: "x", v: box.x },
+    { ax: "y", v: box.y },
+    { ax: "z", v: box.z },
+  ];
+  ranked.sort((a, b) => {
+    if (Math.abs(a.v - b.v) > 1e-6) return a.v - b.v;
+    const order: Record<ReliefAxis, number> = { z: 0, y: 1, x: 2 };
+    return order[a.ax] - order[b.ax];
+  });
+  return ranked[0].ax;
+}
+
+/**
+ * Top-down footprint on the stock (stock width × depth), aligned with how we scale the mesh:
+ * bed plane uses STL X×Y when thickness is Z; otherwise maps the two non-thickness axes to
+ * width/depth without sorting edges (sorting caused “fat” silhouettes on some exports).
  */
 export function patternFootprintOnStockTopMm(box: PatternSize): {
   widthMm: number;
   depthMm: number;
 } {
-  const vals = [box.x, box.y, box.z].sort((a, b) => a - b);
-  const v1 = vals[1];
-  const v2 = vals[2];
+  const t = reliefThicknessAxis(box);
+  if (t === "z") {
+    return {
+      widthMm: Math.max(box.x, 1e-6),
+      depthMm: Math.max(box.y, 1e-6),
+    };
+  }
+  if (t === "y") {
+    return {
+      widthMm: Math.max(box.x, 1e-6),
+      depthMm: Math.max(box.z, 1e-6),
+    };
+  }
   return {
-    widthMm: Math.max(v1, v2, 1e-6),
-    depthMm: Math.max(Math.min(v1, v2), 1e-6),
+    widthMm: Math.max(box.y, 1e-6),
+    depthMm: Math.max(box.z, 1e-6),
   };
 }
 
-/** Smallest box edge — used with stock thickness when auto-fitting uniform scale. */
+/** Carve-depth extent along the relief axis (for stock thickness checks and auto-fit). */
 export function patternThicknessHeuristicMm(box: PatternSize): number {
-  return Math.max(1e-6, Math.min(box.x, box.y, box.z));
+  const t = reliefThicknessAxis(box);
+  return Math.max(1e-6, box[t]);
+}
+
+/**
+ * Uniform scale so the mesh fits usable stock (margins applied). Always scales X, Y, and Z by
+ * the same factor so proportions are preserved.
+ */
+export function uniformScaleToFitStock(
+  nat: PatternSize,
+  stockWidthMm: number,
+  stockDepthMm: number,
+  stockThicknessMm: number,
+  marginMm: number,
+): number {
+  const m = Math.max(0, marginMm);
+  const usableW = Math.max(1, stockWidthMm - 2 * m);
+  const usableD = Math.max(1, stockDepthMm - 2 * m);
+  const usableZ = Math.max(0.5, stockThicknessMm - m);
+  const fp = patternFootprintOnStockTopMm(nat);
+  const thick = patternThicknessHeuristicMm(nat);
+  return Math.min(
+    usableW / fp.widthMm,
+    usableD / fp.depthMm,
+    usableZ / thick,
+  );
 }
 
 /**
@@ -127,27 +182,19 @@ export function buildStlForKiri(
 
   let sx: number, sy: number, sz: number;
   if (linkPatternSizes) {
-    const target =
+    const kx = patternSizeMm.x / nativeSize.x;
+    const ky = patternSizeMm.y / nativeSize.y;
+    const kz = patternSizeMm.z / nativeSize.z;
+    const r =
       patternScaleAxis === "uniform"
-        ? Math.max(patternSizeMm.x, patternSizeMm.y, patternSizeMm.z)
+        ? Math.min(kx, ky, kz)
         : patternScaleAxis === "x"
-          ? patternSizeMm.x
+          ? kx
           : patternScaleAxis === "y"
-            ? patternSizeMm.y
+            ? ky
             : patternScaleAxis === "z"
-              ? patternSizeMm.z
-              : Math.max(patternSizeMm.x, patternSizeMm.y, patternSizeMm.z);
-    const base =
-      patternScaleAxis === "uniform"
-        ? Math.max(nativeSize.x, nativeSize.y, nativeSize.z)
-        : patternScaleAxis === "x"
-          ? nativeSize.x
-          : patternScaleAxis === "y"
-            ? nativeSize.y
-            : patternScaleAxis === "z"
-              ? nativeSize.z
-              : Math.max(nativeSize.x, nativeSize.y, nativeSize.z);
-    const r = target / base;
+              ? kz
+              : Math.min(kx, ky, kz);
     sx = sy = sz = r;
   } else {
     sx = patternSizeMm.x / nativeSize.x;

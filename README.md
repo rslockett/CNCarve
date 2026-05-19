@@ -17,8 +17,8 @@ Open the URL printed in the terminal (defaults to `http://127.0.0.1:3000`).
 1. Push this repository to GitHub (see below).
 2. In [Vercel](https://vercel.com): **Add New… → Project** → import `rslockett/CNCarve`.
 3. Under **Root Directory**, set **`web`** (not the repo root). Vercel should detect **Next.js**.
-4. **Build Command:** `pnpm run build` (default when lockfile is `pnpm-lock.yaml` in `web/`).
-5. **Install Command:** leave default (`pnpm install`, or `corepack enable && pnpm install` if prompted).
+4. **Build Command:** `pnpm run build` (or leave default — `web/vercel.json` pins this).
+5. **Install Command:** leave **empty** / default so Vercel runs **`pnpm install`**. If the log ever shows `Running "install" command: pnpm run build`, open **Settings → General → Build & Development Settings**, clear the **Install Command** override, and redeploy. The committed `web/vercel.json` also forces `pnpm install --frozen-lockfile` when Root Directory is `web`.
 6. Deploy. Your production URL is HTTPS, which satisfies Web Serial when you use the hosted app from Windows.
 
 Optional: set **`NEXT_PUBLIC_KIRI_URL`** in Vercel → Project → Environment Variables if you host Kiri elsewhere; otherwise the app uses `https://grid.space/kiri/`.
