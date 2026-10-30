@@ -326,6 +326,8 @@ export class GrblSerial {
   onDiagnostic?: (event: GrblDiagnostic) => void;
   /** Legacy raw-line callback (used by RunPanel to mirror RX into the serial log). */
   onLine?: (line: string) => void;
+  /** Extra short-lived line listeners (e.g. collecting `$$` output). */
+  private lineTaps = new Set<(line: string) => void>();
 
   private emit(event: GrblDiagnostic): void {
     try {
@@ -512,6 +514,13 @@ export class GrblSerial {
               this.emit({ t: Date.now(), kind: "rx", line: ln });
             }
             this.onLine?.(ln);
+            for (const tap of this.lineTaps) {
+              try {
+                tap(ln);
+              } catch {
+                /* a listener bug must not stop the reader */
+              }
+            }
           }
         }
       }
@@ -581,6 +590,25 @@ export class GrblSerial {
   }
 
   /** Send one line and wait for ok/error (ordering-safe). */
+  /**
+   * Read GRBL settings with `$$`. Read-only. Returns `{ 30: 1000, 22: 1, ... }`.
+   * Do not call while a job is streaming.
+   */
+  async readSettings(timeoutMs = 6000): Promise<Record<number, number>> {
+    const found: Record<number, number> = {};
+    const tap = (ln: string) => {
+      const m = /^\$(\d+)=(-?\d+(?:\.\d+)?)/.exec(ln);
+      if (m) found[Number(m[1])] = Number(m[2]);
+    };
+    this.lineTaps.add(tap);
+    try {
+      await this.sendCommand("$$", timeoutMs);
+    } finally {
+      this.lineTaps.delete(tap);
+    }
+    return found;
+  }
+
   async sendCommand(line: string, timeoutMs = 10_000): Promise<void> {
     const sentAt = Date.now();
     this.emit({ t: sentAt, kind: "tx", line });

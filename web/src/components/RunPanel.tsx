@@ -19,6 +19,8 @@ import {
   scanGcodeModalState,
 } from "@/lib/gcodeRecovery";
 import { getMachineOrDefault } from "@/lib/wizard";
+import { checkMachineSettings } from "@/lib/machineCheck";
+import { MachineCheckCard, type MachineCheckState } from "./MachineCheckCard";
 import { flushSync } from "react-dom";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -129,6 +131,8 @@ export function RunPanel({
   const streamWakeLockRef = useRef<WakeLockSentinel | null>(null);
   const abortRef = useRef(false);
   const [connected, setConnected] = useState(false);
+  /** Read-only `$$` check shown after connecting. */
+  const [machineCheck, setMachineCheck] = useState<MachineCheckState>({ kind: "idle" });
   const [streaming, setStreaming] = useState(false);
   const [elapsedSec, setElapsedSec] = useState(0);
   const elapsedTimerRef = useRef<number | null>(null);
@@ -426,6 +430,28 @@ export function RunPanel({
     [appendSerialLog, exportedGcode, releaseStreamWakeLock],
   );
 
+  const runMachineCheck = async () => {
+    setMachineCheck({ kind: "reading" });
+    try {
+      const settings = await serialRef.current.readSettings();
+      if (Object.keys(settings).length === 0) throw new Error("The machine didn't list any settings.");
+      setMachineCheck({ kind: "done", items: checkMachineSettings(settings) });
+    } catch (e) {
+      setMachineCheck({ kind: "error", message: e instanceof Error ? e.message : String(e) });
+    }
+  };
+
+  const applySettingFix = async (command: string) => {
+    if (!connected || streaming) return;
+    try {
+      await serialRef.current.sendCommand(command);
+      appendSerialLog(`(Setting changed: ${command})`);
+    } catch (e) {
+      setLastError(e instanceof Error ? e.message : String(e));
+    }
+    await runMachineCheck();
+  };
+
   const connect = async () => {
     setLastError(null);
     try {
@@ -435,6 +461,9 @@ export function RunPanel({
       await s.connect();
       setConnected(true);
       appendSerialLog("--- Connected ---");
+      // Most 3018 boards restart when USB connects; give GRBL a moment, then read settings.
+      setMachineCheck({ kind: "reading" });
+      window.setTimeout(() => void runMachineCheck(), 2500);
     } catch (e) {
       setLastError(e instanceof Error ? e.message : String(e));
     }
@@ -452,6 +481,7 @@ export function RunPanel({
     setLastWorkPos(null);
     await serialRef.current.disconnect();
     setConnected(false);
+    setMachineCheck({ kind: "idle" });
     appendSerialLog("--- Disconnected ---");
   };
 
@@ -1174,6 +1204,16 @@ export function RunPanel({
             </p>
           )}
         </div>
+      )}
+
+      {connected && (
+        <MachineCheckCard
+          state={machineCheck}
+          compact={compact}
+          disabled={streaming}
+          onRecheck={() => void runMachineCheck()}
+          onApplyFix={(cmd) => void applySettingFix(cmd)}
+        />
       )}
 
       {connected && !hasHomed && (
