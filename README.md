@@ -12,6 +12,21 @@ pnpm dev
 
 Open the URL printed in the terminal (defaults to `http://127.0.0.1:3000`).
 
+## CNCarve relief engine (one bit, recommended for reliefs)
+
+For one-bit relief carving (icons, crosses, plaques) use **Setup → Carve with CNCarve engine**
+(or **Carving jobs** in the toolbar) instead of importing into Kiri:Moto. The engine:
+
+- removes wood in shallow layers before the detail pass, so a narrow V-bit is never buried
+  at full depth (Kiri's one-bit contour cuts the whole depth in one pass);
+- accounts for the bit's real shape so its sides never cut into neighbouring detail;
+- splits the carving into short jobs (about 45 minutes or less) that can simply be re-run after a stop;
+- simulates the carve and checks every line against stock GRBL 1.1 before you run anything.
+
+Code lives in `web/src/lib/relief/`; `web/scripts/relief-cli.ts` runs the same engine from the
+command line. After connecting, the machine panel also reads the GRBL settings (`$$`, read-only)
+and flags problems such as laser mode left on or homing off.
+
 ## Deploy on Vercel (from this GitHub repo)
 
 1. Push this repository to GitHub (see below).
