@@ -1,9 +1,7 @@
 "use client";
 
-import { FullWorkspace } from "@/components/FullWorkspace";
+import { SimpleCarve } from "@/components/carve/SimpleCarve";
 
 export default function Home() {
-  return (
-    <FullWorkspace />
-  );
+  return <SimpleCarve />;
 }

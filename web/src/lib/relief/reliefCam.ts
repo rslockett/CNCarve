@@ -1,5 +1,5 @@
 /**
- * CNCarve relief engine: one bit, layered roughing + detail passes, short restartable jobs.
+ * CNCarve relief engine: one bit, layered roughing + detail pass, as ONE continuous program.
  *
  * Why this exists: Kiri's single-bit relief path makes one contour pass at full depth. With a
  * narrow V-bit in hardwood that buries the cone 3–5 mm deep at once, which stalls the 3018,
@@ -7,8 +7,11 @@
  * follows the surface, and every toolpath accounts for the bit's real shape so the side of the
  * cone never cuts into neighbouring detail.
  *
- * Coordinates: Z0 = top of the board. XY zero follows the Setup placement — centre of the board
- * for "Center", otherwise the front-left corner of the board (same convention as the Kiri path).
+ * Coordinates: X0 Y0 = centre of the board (the design is centred on it), Z0 = top of the board.
+ *
+ * Recovery: every cutting segment starts the same way — rapid over at a safe height, rapid down
+ * to just above the wood, then plunge. Those are "restart points". After any stop the carve can
+ * restart at the beginning of a segment with nothing but "spindle on"; re-cut moves only cut air.
  */
 
 import { dilate4, rasterizeRelief, type HeightMap } from "./heightmap";
@@ -19,7 +22,7 @@ export type BitShape =
   | { type: "flat"; diameterMm: number };
 
 export type ReliefCamParams = {
-  /** Finish pass spacing (mm) */
+  /** Detail pass spacing (mm) */
   finishStepMm: number;
   /** Rough pass spacing (mm) */
   roughStepMm: number;
@@ -39,19 +42,26 @@ export type ReliefCamParams = {
   spindleS: number;
   safeZ: number;
   clearZ: number;
-  /** Number of pieces each stage is split into (by height on the board). */
-  regions: number;
   /** Grid resolution (mm per pixel). */
   resMm: number;
 };
 
-export type ReliefJob = {
-  fileName: string;
-  title: string;
-  kind: "dry_run" | "rough" | "finish";
+/** A labelled stretch of the program, by index into the GRBL lines (comments removed). */
+export type CarveSection = { label: string; start: number };
+
+export type CarveProgram = {
+  /** The whole carve, start to finish. */
   gcode: string;
+  /** Number of lines GRBL will receive (comments removed). */
+  lineCount: number;
+  /** Line indices (comments removed) where a segment starts at a safe height. Ascending. */
+  restartPoints: number[];
+  sections: CarveSection[];
+  /** Spindle-off trace of the carving area, 2 mm above the board. */
+  traceGcode: string;
   estMinutes: number;
-  lines: number;
+  /** Rough share of the time spent in each section (same order as `sections`). */
+  sectionMinutes: number[];
 };
 
 export type ReliefPreview = {
@@ -66,18 +76,18 @@ export type ReliefPreview = {
 };
 
 export type ReliefResult = {
-  jobs: ReliefJob[];
+  program: CarveProgram;
   preview: ReliefPreview;
   summary: {
     designWidthMm: number;
     designDepthMm: number;
     reliefDepthMm: number;
     cutDepthMm: number;
+    /** Machined area including the saw groove (mm, relative to board centre). */
     workMinX: number;
     workMaxX: number;
     workMinY: number;
     workMaxY: number;
-    totalMinutes: number;
     /** Worst place the simulated cut goes below the design (mm). */
     maxGougeMm: number;
     /** Share of the design within 0.15 mm of the target after carving. */
@@ -91,49 +101,11 @@ export type ReliefInput = {
   vertices: Float32Array;
   bit: BitShape;
   params: ReliefCamParams;
-  placement: ReliefPlacement;
+  board: { widthMm: number; depthMm: number; thicknessMm: number };
+  /** Label written into the file header */
+  name?: string;
   onProgress?: (fraction: number, label: string) => void;
 };
-
-/**
- * Where XY zero is and where the design sits on the board.
- * - `center`: XY zero = centre of the board = centre of the design.
- * - otherwise: XY zero = front-left corner of the board; the design is pushed toward the chosen
- *   side, `marginMm` in from the edges (the same placements Setup offers for Kiri).
- */
-export type ReliefPlacement = {
-  where:
-    | "center"
-    | "front_left"
-    | "front_right"
-    | "back_left"
-    | "back_right"
-    | "left"
-    | "right"
-    | "front"
-    | "back";
-  stockWidthMm: number;
-  stockDepthMm: number;
-  marginMm: number;
-};
-
-export function designCenterForPlacement(
-  pl: ReliefPlacement,
-  halfW: number,
-  halfD: number,
-): { x: number; y: number } {
-  if (pl.where === "center") return { x: 0, y: 0 };
-  const m = Math.max(0, pl.marginMm);
-  const left = m + halfW,
-    right = pl.stockWidthMm - m - halfW,
-    midX = pl.stockWidthMm / 2;
-  const front = m + halfD,
-    back = pl.stockDepthMm - m - halfD,
-    midY = pl.stockDepthMm / 2;
-  const x = pl.where.includes("left") ? left : pl.where.includes("right") ? right : midX;
-  const y = pl.where.startsWith("front") ? front : pl.where.startsWith("back") ? back : midY;
-  return { x, y };
-}
 
 /** Height of the bit's cutting surface above its tip at distance r from the centre. */
 export function bitProfile(bit: BitShape, r: number): number {
@@ -257,31 +229,41 @@ function compress(pts: [number, number, number][], tol = 0.004): [number, number
 
 const f3 = (v: number) => (Math.abs(v) < 0.0005 ? 0 : v).toFixed(3);
 
-class GcodeWriter {
-  lines: string[];
+/** Builds one program and keeps track of GRBL line numbers (comments don't count). */
+class ProgramWriter {
+  lines: string[] = [];
+  codeLines = 0;
   cutMin = 0;
   rapidMm = 0;
   pos: [number, number, number];
+  restartPoints: number[] = [];
+  sections: CarveSection[] = [];
+  sectionStartMin: number[] = [];
   private feed: number | null = null;
-  constructor(
-    titleLines: string[],
-    private P: ReliefCamParams,
-  ) {
-    this.lines = [
-      ...titleLines.map((t) => `(${t.replace(/[()]/g, "-")})`),
-      "(Zero - Z0 is the top of the board)",
-      "G21 G90 G17 G94",
-      `G0 Z${f3(P.safeZ)}`,
-      `M3 S${P.spindleS}`,
-      "G4 P4",
-    ];
+  constructor(private P: ReliefCamParams) {
     this.pos = [0, 0, P.safeZ];
+  }
+  comment(text: string) {
+    this.lines.push(`(${text.replace(/[()]/g, "-")})`);
+  }
+  code(line: string) {
+    this.lines.push(line);
+    this.codeLines++;
+  }
+  section(label: string) {
+    this.comment(`SECTION ${label}`);
+    this.sections.push({ label, start: this.codeLines });
+    this.sectionStartMin.push(this.minutes());
+  }
+  /** Mark the next code line as a safe place to restart after a stop. */
+  restartHere() {
+    this.restartPoints.push(this.codeLines);
   }
   g0(x?: number, y?: number, z?: number) {
     const n: [number, number, number] = [x ?? this.pos[0], y ?? this.pos[1], z ?? this.pos[2]];
     this.rapidMm += Math.hypot(n[0] - this.pos[0], n[1] - this.pos[1], n[2] - this.pos[2]);
     this.pos = n;
-    this.lines.push(
+    this.code(
       "G0" +
         (x !== undefined ? ` X${f3(x)}` : "") +
         (y !== undefined ? ` Y${f3(y)}` : "") +
@@ -292,26 +274,28 @@ class GcodeWriter {
     const d = Math.hypot(x - this.pos[0], y - this.pos[1], z - this.pos[2]);
     this.cutMin += d / f;
     this.pos = [x, y, z];
-    this.lines.push(`G1 X${f3(x)} Y${f3(y)} Z${f3(z)}` + (f !== this.feed ? ` F${f}` : ""));
+    this.code(`G1 X${f3(x)} Y${f3(y)} Z${f3(z)}` + (f !== this.feed ? ` F${f}` : ""));
     this.feed = f;
   }
   plunge(z: number) {
     this.cutMin += Math.abs(this.pos[2] - z) / this.P.feedPlunge;
     this.pos = [this.pos[0], this.pos[1], z];
-    this.lines.push(`G1 Z${f3(z)} F${this.P.feedPlunge}`);
+    // Always state the feed: after a restart the controller may not remember it.
+    this.code(`G1 Z${f3(z)} F${this.P.feedPlunge}`);
     this.feed = this.P.feedPlunge;
   }
-  finish(): { gcode: string; estMinutes: number; lines: number } {
-    this.g0(undefined, undefined, this.P.safeZ);
-    this.lines.push("M5", "G0 X0 Y0", "M30");
-    // +25% for acceleration on a small hobby machine
-    const estMinutes = (this.cutMin + this.rapidMm / 1500) * 1.25;
-    return { gcode: this.lines.join("\n") + "\n", estMinutes, lines: this.lines.length };
+  /** Feed must be restated on the first cut after a restart point. */
+  forgetFeed() {
+    this.feed = null;
+  }
+  /** Minutes so far, +25% for acceleration on a small hobby machine. */
+  minutes() {
+    return (this.cutMin + this.rapidMm / 1500) * 1.25;
   }
 }
 
-export function generateReliefJobs(input: ReliefInput): ReliefResult {
-  const { bit, params: P } = input;
+export function generateCarve(input: ReliefInput): ReliefResult {
+  const { bit, params: P, board } = input;
   const progress = input.onProgress ?? (() => {});
   const problems: string[] = [];
 
@@ -346,63 +330,56 @@ export function generateReliefJobs(input: ReliefInput): ReliefResult {
   let lowest = 0;
   for (let k = 0; k < n; k++) if (work[k] && Zf[k] < lowest) lowest = Zf[k];
 
-  // Design centre → XY zero mapping.
-  let mi0 = W,
-    mi1 = 0,
-    mj0 = H,
-    mj1 = 0;
+  // Bounding boxes of the design and of everything machined.
+  let mi0 = W, mi1 = 0, mj0 = H, mj1 = 0;
+  let wi0 = W, wi1 = 0, wj0 = H, wj1 = 0;
   for (let j = 0; j < H; j++)
-    for (let i = 0; i < W; i++)
-      if (hm.mask[j * W + i]) {
+    for (let i = 0; i < W; i++) {
+      const k = j * W + i;
+      if (hm.mask[k]) {
         if (i < mi0) mi0 = i;
         if (i > mi1) mi1 = i;
         if (j < mj0) mj0 = j;
         if (j > mj1) mj1 = j;
       }
-  const cxPx = (mi0 + mi1) / 2,
-    cyPx = (mj0 + mj1) / 2;
-
-  let wi0 = W,
-    wi1 = 0,
-    wj0 = H,
-    wj1 = 0;
-  for (let j = 0; j < H; j++)
-    for (let i = 0; i < W; i++)
-      if (work[j * W + i]) {
+      if (work[k]) {
         if (i < wi0) wi0 = i;
         if (i > wi1) wi1 = i;
         if (j < wj0) wj0 = j;
         if (j > wj1) wj1 = j;
       }
-  // Place using the full machined area (design + saw groove) so the groove stays on the board.
-  const halfW = Math.max(cxPx - wi0, wi1 - cxPx) * R;
-  const halfD = Math.max(cyPx - wj0, wj1 - cyPx) * R;
-  const centre = designCenterForPlacement(input.placement, halfW, halfD);
-  const X = (i: number) => (i - cxPx) * R + centre.x;
-  const Y = (j: number) => (j - cyPx) * R + centre.y;
-  {
-    const pl = input.placement;
-    const ox = pl.where === "center" ? pl.stockWidthMm / 2 : 0;
-    const oy = pl.where === "center" ? pl.stockDepthMm / 2 : 0;
-    if (
-      X(wi0) + ox < -0.01 ||
-      X(wi1) + ox > pl.stockWidthMm + 0.01 ||
-      Y(wj0) + oy < -0.01 ||
-      Y(wj1) + oy > pl.stockDepthMm + 0.01
-    )
-      problems.push(
-        `The carving area (${((wi1 - wi0) * R).toFixed(1)} × ${((wj1 - wj0) * R).toFixed(1)} mm with its saw groove) is bigger than the board in Setup (${pl.stockWidthMm.toFixed(1)} × ${pl.stockDepthMm.toFixed(1)} mm).`,
-      );
-  }
+    }
+  // Centre the machined area (design + groove) on the board centre = X0 Y0.
+  const cxPx = (wi0 + wi1) / 2,
+    cyPx = (wj0 + wj1) / 2;
+  const X = (i: number) => (i - cxPx) * R;
+  const Y = (j: number) => (j - cyPx) * R;
 
-  /** Cut one set of rows; `surfaceTop` = Z of wood still above each pixel. */
-  const raster = (
-    g: GcodeWriter,
-    Z: Float32Array,
-    rows: number[],
-    feed: number,
-    surfaceTop: Float32Array | null,
-  ) => {
+  const areaW = (wi1 - wi0) * R,
+    areaD = (wj1 - wj0) * R;
+  if (areaW > board.widthMm + 0.01 || areaD > board.depthMm + 0.01)
+    problems.push(
+      `The carving with its saw groove (${areaW.toFixed(1)} × ${areaD.toFixed(1)} mm) is bigger than the board (${board.widthMm.toFixed(1)} × ${board.depthMm.toFixed(1)} mm).`,
+    );
+  if (-lowest > board.thicknessMm - 1)
+    problems.push(
+      `The deepest cut is ${(-lowest).toFixed(1)} mm but the board is only ${board.thicknessMm.toFixed(1)} mm thick.`,
+    );
+
+  const w = new ProgramWriter(P);
+  const bitLabel =
+    bit.type === "vee"
+      ? `${Math.round(bit.halfAngleDeg * 2)} deg V-bit ${bit.tipDiameterMm}mm tip`
+      : `${bit.type} ${bit.diameterMm}mm`;
+  w.comment(`CNCarve relief engine - ${input.name ?? "carving"} - ${bitLabel}`);
+  w.comment("Zero - X0 Y0 is the centre of the board, Z0 is the top of the board");
+  w.code("G21 G90 G17 G94");
+  w.g0(undefined, undefined, P.safeZ);
+  w.code(`M3 S${P.spindleS}`);
+  w.code("G4 P4");
+
+  /** Cut one set of rows; `surfaceTop` = Z of wood still above each pixel (null = board top). */
+  const raster = (Z: Float32Array, rows: number[], feed: number, surfaceTop: Float32Array | null) => {
     let flip = false;
     for (const j of rows) {
       const segs: number[][] = [];
@@ -410,8 +387,7 @@ export function generateReliefJobs(input: ReliefInput): ReliefResult {
       for (let i = 0; i < W; i++) {
         const k = j * W + i;
         const top0 = surfaceTop ? surfaceTop[k] : 0;
-        const need = work[k] === 1 && Z[k] < top0 - 1e-3;
-        if (need) {
+        if (work[k] === 1 && Z[k] < top0 - 1e-3) {
           if (!cur) {
             cur = [];
             segs.push(cur);
@@ -427,40 +403,67 @@ export function generateReliefJobs(input: ReliefInput): ReliefResult {
       flip = !flip;
       for (const s of segs) {
         const pts = compress(s.map((i) => [X(i), Y(j), Z[j * W + i]] as [number, number, number]));
-        if (g.pos[2] < P.clearZ) g.g0(undefined, undefined, P.clearZ);
-        g.g0(pts[0][0], pts[0][1]);
+        if (w.pos[2] < P.clearZ) w.g0(undefined, undefined, P.clearZ);
+        // Restart point: from here the segment needs nothing but a spinning bit.
+        w.restartHere();
+        w.forgetFeed();
+        w.g0(pts[0][0], pts[0][1]);
         const startTop = surfaceTop ? surfaceTop[j * W + s[0]] : 0;
-        const above = Math.min(P.clearZ, startTop + 0.3);
-        if (above < P.clearZ) g.g0(undefined, undefined, above);
-        g.plunge(pts[0][2]);
-        for (let a = 1; a < pts.length; a++) g.g1(pts[a][0], pts[a][1], pts[a][2], feed);
-        g.g0(undefined, undefined, P.clearZ);
+        w.g0(undefined, undefined, Math.min(P.clearZ, startTop + 0.3));
+        w.plunge(pts[0][2]);
+        for (let a = 1; a < pts.length; a++) w.g1(pts[a][0], pts[a][1], pts[a][2], feed);
+        w.g0(undefined, undefined, P.clearZ);
       }
     }
   };
 
-  const jobs: ReliefJob[] = [];
-  const regionNames =
-    P.regions === 3 ? ["bottom", "middle", "top"] : Array.from({ length: P.regions }, (_, i) => `part ${i + 1}`);
-  const cuts = Array.from({ length: P.regions + 1 }, (_, i) =>
-    Math.floor(wj0 + ((wj1 + 1 - wj0) * i) / P.regions),
-  );
-  const rowsFor = (p: number, stepPx: number) => {
-    const out: number[] = [];
-    for (let j = Math.ceil(cuts[p] / stepPx) * stepPx; j < cuts[p + 1]; j += stepPx) out.push(j);
-    return out;
-  };
+  // Roughing: layer by layer over the whole piece.
+  const roughPx = Math.max(1, Math.round(P.roughStepMm / R));
+  const roughRows: number[] = [];
+  for (let j = Math.ceil(wj0 / roughPx) * roughPx; j <= wj1; j += roughPx) roughRows.push(j);
+  let lo = 0;
+  for (let k = 0; k < n; k++) if (work[k] && Zr[k] < lo) lo = Zr[k];
+  const layers: number[] = [];
+  for (let level = 0; level > lo + 1e-6; ) {
+    level = Math.max(level - P.roughLayerMm, lo);
+    layers.push(level);
+  }
+  const cur = new Float32Array(n);
+  const Zl = new Float32Array(n);
+  layers.forEach((level, li) => {
+    progress(0.25 + (0.35 * li) / layers.length, `Planning roughing layer ${li + 1} of ${layers.length}`);
+    w.section(`Roughing - layer ${li + 1} of ${layers.length}`);
+    for (let k = 0; k < n; k++) Zl[k] = Math.max(Zr[k], level);
+    raster(Zl, roughRows, P.feedRough, cur);
+    for (let k = 0; k < n; k++) if (work[k] && Zl[k] < cur[k]) cur[k] = Zl[k];
+  });
 
-  // Step 0: dry run, spindle off, 2 mm above the board. Rapid (G0) moves only: the Run panel
-  // blocks files that feed-move (G1) without a spindle-on, which is right for real cuts.
-  {
-    const x0 = X(wi0),
-      x1 = X(wi1),
-      y0 = Y(wj0),
-      y1 = Y(wj1);
-    const L = [
-      "(Step 0 - DRY RUN - traces the carving area 2mm above the board - spindle stays OFF)",
+  // Detail pass, in three parts so progress reads naturally.
+  progress(0.62, "Planning the detail pass");
+  const finishPx = Math.max(1, Math.round(P.finishStepMm / R));
+  const finishRows: number[] = [];
+  for (let j = Math.ceil(wj0 / finishPx) * finishPx; j <= wj1; j += finishPx) finishRows.push(j);
+  const parts = 3;
+  for (let p = 0; p < parts; p++) {
+    w.section(`Detail pass - part ${p + 1} of ${parts}`);
+    const a = Math.floor((finishRows.length * p) / parts),
+      b = Math.floor((finishRows.length * (p + 1)) / parts);
+    raster(Zf, finishRows.slice(a, b), P.feedFinish, null);
+  }
+  w.g0(undefined, undefined, P.safeZ);
+  w.code("M5");
+  w.code("G0 X0 Y0");
+  w.code("M30");
+  const totalMin = w.minutes();
+  const sectionMinutes = w.sectionStartMin.map((s, i) => (w.sectionStartMin[i + 1] ?? totalMin) - s);
+
+  // Spindle-off trace, rapid moves only (the machine panel blocks feed moves without a spindle).
+  const x0 = X(wi0), x1 = X(wi1), y0 = Y(wj0), y1 = Y(wj1);
+  const traceGcode =
+    [
+      "(Trace - spindle OFF - follows the edge of the carving area 2mm above the board)",
       "G21 G90 G17 G94",
+      "M5",
       "G0 Z5",
       "G0 X0 Y0",
       "G0 Z2",
@@ -471,92 +474,16 @@ export function generateReliefJobs(input: ReliefInput): ReliefResult {
       `G0 X${f3(x0)} Y${f3(y0)}`,
       "G0 Z5",
       "G0 X0 Y0",
-      "M30",
-    ];
-    jobs.push({
-      fileName: "0_dry_run_no_cutting.nc",
-      title: "Dry run — spindle off, traces the area 2 mm above the board",
-      kind: "dry_run",
-      gcode: L.join("\n") + "\n",
-      estMinutes: 1,
-      lines: L.length,
-    });
-  }
+    ].join("\n") + "\n";
 
-  const bitLabel =
-    bit.type === "vee"
-      ? `${bit.halfAngleDeg * 2} deg V-bit ${bit.tipDiameterMm}mm tip`
-      : `${bit.type} ${bit.diameterMm}mm`;
-
-  // Roughing, layer by layer, region by region.
-  const roughPx = Math.max(1, Math.round(P.roughStepMm / R));
-  for (let p = 0; p < P.regions; p++) {
-    progress(0.25 + (0.35 * p) / P.regions, `Planning roughing (${regionNames[p]})`);
-    const g = new GcodeWriter(
-      [
-        `Step ${p + 1} - ROUGHING ${p + 1} of ${P.regions} - ${regionNames[p]} - removes wood in ${P.roughLayerMm}mm layers`,
-        `CNCarve relief engine - ${bitLabel}`,
-      ],
-      P,
-    );
-    const rows = rowsFor(p, roughPx);
-    let lo = 0;
-    for (let j = cuts[p]; j < cuts[p + 1]; j++)
-      for (let i = 0; i < W; i++) {
-        const k = j * W + i;
-        if (work[k] && Zr[k] < lo) lo = Zr[k];
-      }
-    const cur = new Float32Array(n);
-    let level = 0;
-    const Zl = new Float32Array(n);
-    while (level > lo + 1e-6) {
-      level = Math.max(level - P.roughLayerMm, lo);
-      for (let k = 0; k < n; k++) Zl[k] = Math.max(Zr[k], level);
-      raster(g, Zl, rows, P.feedRough, cur);
-      for (let k = 0; k < n; k++) if (work[k] && Zl[k] < cur[k]) cur[k] = Zl[k];
-    }
-    const r = g.finish();
-    jobs.push({
-      fileName: `${p + 1}_roughing_${regionNames[p].replace(/\s+/g, "_")}.nc`,
-      title: `Roughing ${p + 1} of ${P.regions} — ${regionNames[p]}`,
-      kind: "rough",
-      ...r,
-    });
-  }
-
-  // Detail passes.
-  const finishPx = Math.max(1, Math.round(P.finishStepMm / R));
-  for (let p = 0; p < P.regions; p++) {
-    progress(0.6 + (0.2 * p) / P.regions, `Planning detail passes (${regionNames[p]})`);
-    const g = new GcodeWriter(
-      [
-        `Step ${P.regions + p + 1} - DETAIL ${p + 1} of ${P.regions} - ${regionNames[p]}`,
-        `CNCarve relief engine - ${bitLabel}`,
-      ],
-      P,
-    );
-    raster(g, Zf, rowsFor(p, finishPx), P.feedFinish, null);
-    const r = g.finish();
-    jobs.push({
-      fileName: `${P.regions + p + 1}_detail_${regionNames[p].replace(/\s+/g, "_")}.nc`,
-      title: `Detail ${p + 1} of ${P.regions} — ${regionNames[p]}`,
-      kind: "finish",
-      ...r,
-    });
-  }
-
-  // Simulate the detail passes: sweep the bit along every finishing row.
+  // Simulate the detail pass: sweep the bit along every finishing row.
   progress(0.82, "Simulating the carve");
-  // Tip height wherever the bit actually travels (finishing rows inside the work area).
   const tip = new Float32Array(n).fill(1e6);
-  for (let p = 0; p < P.regions; p++)
-    for (const j of rowsFor(p, finishPx))
-      for (let i = 0; i < W; i++) {
-        const k = j * W + i;
-        if (work[k] && Zf[k] < 0) tip[k] = Zf[k];
-      }
-  // carved(x) = min over nearby tip positions of (tip + bit profile). Sorted offsets let each
-  // pixel stop once even the lowest tip in reach could not cut deeper.
+  for (const j of finishRows)
+    for (let i = 0; i < W; i++) {
+      const k = j * W + i;
+      if (work[k] && Zf[k] < 0) tip[k] = Zf[k];
+    }
   const kWin = offsets.reduce((a, o) => Math.max(a, Math.abs(o.dx), Math.abs(o.dy)), 0);
   const localMin = squareFilter(tip, W, H, kWin, false);
   const carved = new Float32Array(n).fill(0);
@@ -577,9 +504,7 @@ export function generateReliefJobs(input: ReliefInput): ReliefResult {
       carved[idx] = best;
     }
   }
-  let maxGouge = 0,
-    good = 0,
-    total = 0;
+  let maxGouge = 0, good = 0, total = 0;
   for (let k = 0; k < n; k++) {
     if (!hm.mask[k]) continue;
     total++;
@@ -588,9 +513,10 @@ export function generateReliefJobs(input: ReliefInput): ReliefResult {
     if (Math.abs(carved[k] - T[k]) <= 0.15) good++;
   }
 
-  // Self-check every file the way GRBL will read it.
   progress(0.95, "Checking every line for GRBL");
-  for (const job of jobs) problems.push(...validateGrblGcode(job.gcode, job.fileName, P.clearZ));
+  const gcode = w.lines.join("\n") + "\n";
+  problems.push(...validateGrblGcode(gcode, "carve", P.clearZ));
+  problems.push(...validateGrblGcode(traceGcode, "trace", 1.5));
   if (maxGouge > 0.1)
     problems.push(`Simulation shows the bit cutting ${maxGouge.toFixed(2)} mm into the design.`);
 
@@ -599,18 +525,25 @@ export function generateReliefJobs(input: ReliefInput): ReliefResult {
 
   progress(1, "Done");
   return {
-    jobs,
+    program: {
+      gcode,
+      lineCount: w.codeLines,
+      restartPoints: w.restartPoints,
+      sections: w.sections,
+      traceGcode,
+      estMinutes: totalMin,
+      sectionMinutes,
+    },
     preview: { width: W, height: H, target, carved, work, res: R },
     summary: {
       designWidthMm: (mi1 - mi0) * R,
       designDepthMm: (mj1 - mj0) * R,
       reliefDepthMm: reliefDepth,
       cutDepthMm: -lowest,
-      workMinX: X(wi0),
-      workMaxX: X(wi1),
-      workMinY: Y(wj0),
-      workMaxY: Y(wj1),
-      totalMinutes: jobs.reduce((a, j) => a + j.estMinutes, 0),
+      workMinX: x0,
+      workMaxX: x1,
+      workMinY: y0,
+      workMaxY: y1,
       maxGougeMm: maxGouge,
       accuracyPct: total ? (100 * good) / total : 0,
       problems,
