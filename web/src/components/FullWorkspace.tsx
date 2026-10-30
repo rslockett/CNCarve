@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useAppState } from "@/context/AppState";
 import {
   getKiriUrl,
@@ -22,7 +23,6 @@ import type { WizardAnswers } from "@/lib/presets/types";
 import { isPatternSizeReady, mapWizardToKiri } from "@/lib/wizard";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { MachinePopout } from "./MachinePopout";
-import { ReliefEnginePanel } from "./ReliefEnginePanel";
 import { SendToMachineWizard } from "./SendToMachineWizard";
 import { SetupWizard } from "./SetupWizard";
 
@@ -101,8 +101,6 @@ export function FullWorkspace() {
   /** Remount iframe to recover from WebGL context loss (Kiri needs WebGL; without it postMessage import breaks internally). */
   const [kiriIframeKey, setKiriIframeKey] = useState(0);
   const [companionPhase, setCompanionPhase] = useState<"gcode" | "machine">("gcode");
-  /** CNCarve relief engine (one-bit layered carving) panel. */
-  const [reliefOpen, setReliefOpen] = useState(false);
   const [gcodePanelPos, setGcodePanelPos] = useState(() => getDefaultGcodeCompanionPos());
   const dragRef = useRef<{ id: number; dx: number; dy: number } | null>(null);
 
@@ -593,24 +591,6 @@ export function FullWorkspace() {
     setDock("send");
   }, [clearGcodeFetchTimeout]);
 
-  const openReliefEngine = useCallback(() => {
-    setWizardOpen(false);
-    setImportStatus(null);
-    setReliefOpen(true);
-  }, []);
-
-  /** Load one engine job into the machine panel (same streaming + recovery as Kiri G-code). */
-  const loadReliefJob = useCallback(
-    (gcode: string) => {
-      setExportedGcode(gcode);
-      setReliefOpen(false);
-      setWizardOpen(false);
-      setDock("send");
-      setCompanionPhase("machine");
-    },
-    [setExportedGcode],
-  );
-
   const handleImportToKiri = useCallback((answersOverride?: WizardAnswers) => {
     const effectiveAnswers = answersOverride ?? answers;
     const buffer = stlBufferRef.current;
@@ -712,13 +692,12 @@ export function FullWorkspace() {
             >
               Setup
             </button>
-            <button
-              type="button"
-              onClick={openReliefEngine}
+            <Link
+              href="/"
               className="whitespace-nowrap rounded-lg bg-emerald-700/90 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-600"
             >
-              Carving jobs
-            </button>
+              Simple carve
+            </Link>
             <button
               type="button"
               onClick={openMachineCompanion}
@@ -748,7 +727,6 @@ export function FullWorkspace() {
         }}
         onImportToKiri={handleImportToKiri}
         onSkipToMachine={skipToMachineFromSetup}
-        onOpenReliefEngine={openReliefEngine}
         importStatus={importStatus}
         importBusy={importBusy}
       />
@@ -800,16 +778,6 @@ export function FullWorkspace() {
           </div>
         </div>
       )}
-
-      <ReliefEnginePanel
-        open={reliefOpen}
-        onClose={() => setReliefOpen(false)}
-        onOpenSetup={() => {
-          setReliefOpen(false);
-          openSetup();
-        }}
-        onLoadJob={loadReliefJob}
-      />
 
       {dock === "send" && companionPhase === "machine" && (
         <MachinePopout

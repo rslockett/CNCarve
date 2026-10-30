@@ -594,6 +594,32 @@ export class GrblSerial {
    * Read GRBL settings with `$$`. Read-only. Returns `{ 30: 1000, 22: 1, ... }`.
    * Do not call while a job is streaming.
    */
+  /** Listen to every line GRBL sends (status reports included). Returns an unsubscribe function. */
+  addLineListener(fn: (line: string) => void): () => void {
+    this.lineTaps.add(fn);
+    return () => {
+      this.lineTaps.delete(fn);
+    };
+  }
+
+  /**
+   * Read the G54 work offset (where "zero" is, in machine coordinates) with `$#`. Read-only.
+   * GRBL keeps this in EEPROM, so after homing it should match what was set before a stop.
+   */
+  async readG54(timeoutMs = 6000): Promise<{ x: number; y: number; z: number } | null> {
+    let found: { x: number; y: number; z: number } | null = null;
+    const off = this.addLineListener((ln) => {
+      const m = /^\[G54:(-?[\d.]+),(-?[\d.]+),(-?[\d.]+)/.exec(ln);
+      if (m) found = { x: Number(m[1]), y: Number(m[2]), z: Number(m[3]) };
+    });
+    try {
+      await this.sendCommand("$#", timeoutMs);
+    } finally {
+      off();
+    }
+    return found;
+  }
+
   async readSettings(timeoutMs = 6000): Promise<Record<number, number>> {
     const found: Record<number, number> = {};
     const tap = (ln: string) => {

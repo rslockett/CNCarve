@@ -67,8 +67,6 @@ type Props = {
   onImportToKiri: (answersOverride?: WizardAnswers) => void;
   /** Close setup and open Send to machine (e.g. user already has a .gcode file). */
   onSkipToMachine?: () => void;
-  /** Close setup and open the CNCarve relief engine (one bit, layered, short jobs). */
-  onOpenReliefEngine?: () => void;
   importStatus: string | null;
   importBusy: boolean;
 };
@@ -78,7 +76,6 @@ export function SetupWizard({
   onDismiss,
   onImportToKiri,
   onSkipToMachine,
-  onOpenReliefEngine,
   importStatus,
   importBusy,
 }: Props) {
@@ -976,25 +973,6 @@ export function SetupWizard({
             >
               Close (Kiri stays open)
             </button>
-            {onOpenReliefEngine && (
-              <button
-                type="button"
-                aria-disabled={!canImport}
-                onClick={() => {
-                  const committed = buildCommittedAnswers();
-                  setAnswers(committed);
-                  if (!committed.stlFileName || !isPatternSizeReady(committed)) {
-                    importHintRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-                    return;
-                  }
-                  onOpenReliefEngine();
-                }}
-                title="Recommended for one bit: shallow layers, then detail — short jobs you can re-run"
-                className={`touch-manipulation rounded-xl bg-gradient-to-r from-emerald-500 to-teal-600 px-5 py-3 text-sm font-semibold text-white shadow-lg shadow-emerald-900/40 ${!canImport ? "opacity-60 ring-1 ring-amber-400/50" : ""}`}
-              >
-                Carve with CNCarve engine (recommended)
-              </button>
-            )}
             <button
               type="button"
               aria-disabled={!canImport}

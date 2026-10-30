@@ -1,5 +1,5 @@
 /**
- * Turn Setup answers (machine, bit, wood, quality, board) into relief-engine settings.
+ * Turn the carve choices (machine, bit, wood, quality) into relief-engine settings.
  *
  * Feeds and layer depths are tuned for a stock 3018 spindle. Hardwood (factor 0.65) gives the
  * values tested on the first San Damiano cross: 0.8 mm layers, roughing ~450 mm/min,
@@ -8,7 +8,7 @@
 
 import type { JsonObject, WizardAnswers } from "../presets/types";
 import { getMachineOrDefault, listMaterials } from "../wizard";
-import type { BitShape, ReliefCamParams, ReliefPlacement } from "./reliefCam";
+import type { BitShape, ReliefCamParams } from "./reliefCam";
 
 const MM_PER_IN = 25.4;
 
@@ -16,11 +16,6 @@ function toolMm(tool: JsonObject, key: string, fallbackMm: number): number {
   const raw = Number(tool[key]);
   if (!Number.isFinite(raw) || raw <= 0) return fallbackMm;
   return tool.metric ? raw : raw * MM_PER_IN;
-}
-
-/** The single bit this job uses (Setup's one-bit pick, or the detail bit for two-bit setups). */
-export function reliefToolId(answers: WizardAnswers): number {
-  return answers.camToolStrategy === "single" ? answers.singleToolId : answers.outlineToolId;
 }
 
 export function bitShapeFromTool(tool: JsonObject | undefined): BitShape {
@@ -59,22 +54,28 @@ const FINISH_STEP: Record<WizardAnswers["qualityId"], { vee: number; ball: numbe
   replica: { vee: 0.05, ball: 0.04, flat: 0.1 },
 };
 
+export type CarveChoices = {
+  machineId: string;
+  toolId: number;
+  materialId: string;
+  qualityId: WizardAnswers["qualityId"];
+};
+
 export type ReliefSettings = {
   bit: BitShape;
   bitLabel: string;
   params: ReliefCamParams;
-  placement: ReliefPlacement;
   materialLabel: string;
 };
 
 export function deriveReliefSettings(
-  answers: WizardAnswers,
+  choices: CarveChoices,
   designSizeMm: { x: number; y: number },
 ): ReliefSettings {
-  const preset = getMachineOrDefault(answers.machineId);
-  const toolRow = preset.tools.find((t) => (t.id as number) === reliefToolId(answers));
+  const preset = getMachineOrDefault(choices.machineId);
+  const toolRow = preset.tools.find((t) => (t.id as number) === choices.toolId);
   const bit = bitShapeFromTool(toolRow);
-  const mat = listMaterials()[answers.materialId] ?? { label: "Wood", factor: 1 };
+  const mat = listMaterials()[choices.materialId] ?? { label: "Wood", factor: 1 };
   const f = mat.factor;
 
   const roughLayerMm = Math.round(Math.min(1.5, Math.max(0.3, 1.23 * f)) * 100) / 100;
@@ -88,7 +89,7 @@ export function deriveReliefSettings(
   }
   roughStepMm = Math.round(roughStepMm * 100) / 100;
 
-  const tier = FINISH_STEP[answers.qualityId] ?? FINISH_STEP.balanced;
+  const tier = FINISH_STEP[choices.qualityId] ?? FINISH_STEP.balanced;
   const finishStepMm =
     bit.type === "vee" ? tier.vee : bit.type === "ball" ? tier.ball * bit.diameterMm : tier.flat * bit.diameterMm;
 
@@ -116,14 +117,7 @@ export function deriveReliefSettings(
       spindleS: Math.round(preset.spindleMaxRpm),
       safeZ: 3,
       clearZ: 1,
-      regions: 3,
       resMm,
-    },
-    placement: {
-      where: answers.patternPlacement,
-      stockWidthMm: answers.stockWidthMm,
-      stockDepthMm: answers.stockDepthMm,
-      marginMm: answers.stockMarginMm,
     },
   };
 }
