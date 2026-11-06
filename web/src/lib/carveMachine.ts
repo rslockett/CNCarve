@@ -22,6 +22,8 @@
 import { checkMachineSettings, type MachineCheckItem } from "./machineCheck";
 import { GrblSerial, parseGrblGcodeLines } from "./grblSerial";
 import type { BitShape } from "./relief/reliefCam";
+import { motionFromGrbl, type MotionSettings } from "./relief/motionTime";
+import { loadFactor, predictedAt, recordFactor, saveMotion } from "./carveTime";
 import {
   clearCarve,
   loadProgress,
@@ -49,6 +51,7 @@ export type Busy =
 export type NewCarve = Omit<SavedCarve, "g54" | "startedAt"> & {
   bit?: BitShape;
   area?: SavedCarve["area"];
+  timeline?: number[];
 };
 
 export type Notice = { tone: "info" | "good" | "warn" | "bad"; text: string };
@@ -79,7 +82,11 @@ export type MachineState = {
     startedAt: number;
     /** Line the current run started from (0 for a fresh carve). */
     fromLine: number;
+    /** Minutes left: predicted, corrected by how fast this machine is really going. */
+    etaMinutes: number | null;
   };
+  /** Speed / acceleration settings read from the machine ($$), for time estimates. */
+  motion: MotionSettings | null;
   notice: Notice | null;
 };
 
@@ -114,6 +121,7 @@ export class CarveMachine {
     carve: null,
     finishedCarve: null,
     progress: null,
+    motion: null,
     notice: null,
   };
   /** Pause plumbing: requested flag, next line to send, and the waiter Resume releases. */
@@ -266,7 +274,11 @@ export class CarveMachine {
     if (!this.state.connected || this.state.busy === "carving") return;
     try {
       const s = await this.serial.readSettings();
-      if (Object.keys(s).length) this.set({ settings: checkMachineSettings(s) });
+      if (Object.keys(s).length) {
+        const motion = motionFromGrbl(s);
+        saveMotion(motion); // remembered on this device so estimates are right before connecting
+        this.set({ settings: checkMachineSettings(s), motion });
+      }
     } catch {
       /* shown as "not checked"; user can retry */
     }
@@ -474,13 +486,48 @@ export class CarveMachine {
     const total = c.lineCount;
     const startedAt = Date.now();
     const restartSet = new Set(c.restartPoints);
+    // ---- time measuring (paused time excluded) ----
+    const runStart = Date.now();
+    let pausedMs = 0;
+    const factor0 = loadFactor()?.factor ?? 1;
+    const tl = c.timeline;
+    const predFrom = tl ? predictedAt(tl, fromLine, total) : 0;
+    const predEnd = tl ? predictedAt(tl, total, total) : 0;
+    const measure = (line: number) => {
+      const activeSec = (Date.now() - runStart - pausedMs) / 1000;
+      const predDone = tl ? predictedAt(tl, line, total) - predFrom : 0;
+      return { activeSec, predDone };
+    };
+    const eta = (line: number): number | null => {
+      if (!tl) return null;
+      const { activeSec, predDone } = measure(line);
+      let ratio = factor0;
+      // After a couple of minutes, trust what this carve is really doing more and more.
+      if (activeSec >= 120 && predDone >= 30) {
+        const w = Math.min(1, activeSec / 1200);
+        ratio = factor0 * (1 - w) + (activeSec / predDone) * w;
+      }
+      return ((predEnd - predictedAt(tl, line, total)) * ratio) / 60;
+    };
+    const learn = (line: number) => {
+      const { activeSec, predDone } = measure(line);
+      if (predDone > 0) recordFactor(activeSec / predDone, activeSec / 60);
+    };
+    let lastLine = fromLine;
     this.set({
       busy: "carving",
       paused: false,
       pausing: false,
       carve: c,
       finishedCarve: null,
-      progress: { line: fromLine, total, section: sectionAt(c.sections, fromLine)?.label ?? "", startedAt, fromLine },
+      progress: {
+        line: fromLine,
+        total,
+        section: sectionAt(c.sections, fromLine)?.label ?? "",
+        startedAt,
+        fromLine,
+        etaMinutes: tl ? ((predEnd - predFrom) * factor0) / 60 : null,
+      },
       notice:
         fromLine > 0
           ? {
@@ -503,6 +550,7 @@ export class CarveMachine {
           c.gcode,
           (i, t) => {
             this.nextLine = i;
+            lastLine = i;
             const lastAcked = i - 1;
             if (lastAcked - lastSaved >= 20 || i === t) {
               saveProgress({ id: c.id, lastAcked, updatedAt: Date.now(), finished: false });
@@ -516,6 +564,7 @@ export class CarveMachine {
                   section: sectionAt(c.sections, i)?.label ?? "",
                   startedAt,
                   fromLine,
+                  etaMinutes: eta(i),
                 },
               });
           },
@@ -543,12 +592,14 @@ export class CarveMachine {
           },
         });
         void this.unlockScreen();
+        const pauseStart = Date.now();
 
         // ---- wait for Resume (rejects on emergency stop or a lost connection) ----
         await new Promise<void>((resolve, reject) => {
           this.resumeWaiter = { resolve, reject };
         });
         this.resumeWaiter = null;
+        pausedMs += Date.now() - pauseStart;
 
         // ---- resume: lift (in case it was jogged), spindle on, carry on at the saved segment ----
         this.set({ notice: { tone: "info", text: "Resuming — spindle starting…" } });
@@ -561,10 +612,12 @@ export class CarveMachine {
         this.set({ paused: false, notice: null });
       }
       saveProgress({ id: c.id, lastAcked: total - 1, updatedAt: Date.now(), finished: true });
+      learn(total);
       await clearCarve();
       this.set({ busy: null, paused: false, pausing: false, carve: null, finishedCarve: c, progress: null });
       this.say("good", "Carving finished! Vacuum the chips, then saw along the groove around the design.");
     } catch (e) {
+      learn(lastLine); // even an interrupted carve teaches how fast this machine really is
       const wasStop = this.emergency;
       this.emergency = false;
       this.pauseRequested = false;

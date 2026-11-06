@@ -24,6 +24,8 @@ export type SavedCarve = {
   /** Bit shape and machined area — used by the live carving view (older saves may lack them). */
   bit?: BitShape;
   area?: { minX: number; maxX: number; minY: number; maxY: number };
+  /** Predicted cumulative seconds every 100 lines (see carveTime.ts), for live "time left". */
+  timeline?: number[];
 };
 
 export type CarveProgress = {

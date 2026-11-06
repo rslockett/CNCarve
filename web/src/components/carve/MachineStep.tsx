@@ -4,6 +4,7 @@ import { CarveMachine, type MachineState } from "@/lib/carveMachine";
 import { clearCarve, loadCarve, loadProgress, restartLineFor, type SavedCarve } from "@/lib/carveStore";
 import type { BitShape, CarveProgram } from "@/lib/relief/reliefCam";
 import { LiveCarveView } from "./LiveCarveView";
+import { loadFactor } from "@/lib/carveTime";
 import { useCallback, useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
 
 type Props = {
@@ -16,6 +17,7 @@ type Props = {
         spindleS: number;
         bit: BitShape;
         area: { minX: number; maxX: number; minY: number; maxY: number };
+        timeline: number[];
       })
     | null;
 };
@@ -64,6 +66,8 @@ export function MachineStep({ machine, job }: Props) {
   const s: MachineState = useSyncExternalStore(machine.subscribe, machine.getState, machine.getState);
   // USB support can only be known in the browser; the server render assumes it's there.
   const supported = useSyncExternalStore(noopSubscribe, () => machine.isSupported(), () => true);
+  // Learned time correction, read fresh each render (not cached by the compiler).
+  const timeFactor = useSyncExternalStore(noopSubscribe, () => loadFactor()?.factor ?? 1, () => 1);
   const [saved, setSaved] = useState<SavedCarve | null>(null);
   const [jogStep, setJogStep] = useState(1);
   const [probeMode, setProbeMode] = useState(false);
@@ -139,8 +143,11 @@ export function MachineStep({ machine, job }: Props) {
           <div className="mt-2 h-3 overflow-hidden rounded-full bg-slate-800">
             <div className="h-full bg-gradient-to-r from-teal-500 to-emerald-500 transition-[width]" style={{ width: `${pct}%` }} />
           </div>
-          {est > 0 && sectionMinutes && (
-            <p className="mt-1.5 text-xs text-slate-400">About {minutesText(est - done)} left</p>
+          {p.etaMinutes !== null ? (
+            <p className="mt-1.5 text-xs text-slate-400">About {minutesText(p.etaMinutes)} left</p>
+          ) : (
+            est > 0 &&
+            sectionMinutes && <p className="mt-1.5 text-xs text-slate-400">About {minutesText(est - done)} left</p>
           )}
         </div>
         {s.notice && <p className={`rounded-xl border p-3 text-sm ${TONE[s.notice.tone]}`}>{s.notice.text}</p>}
@@ -359,7 +366,7 @@ export function MachineStep({ machine, job }: Props) {
               ) : (
                 <>
                   <p className="mt-1 text-xs text-slate-400">
-                    One continuous carve, about {minutesText(job.estMinutes)}. Turn on dust collection and keep
+                    One continuous carve, about {minutesText(job.estMinutes * timeFactor)}. Turn on dust collection and keep
                     this page open.
                   </p>
                   <button
@@ -380,6 +387,7 @@ export function MachineStep({ machine, job }: Props) {
                         spindleS: job.spindleS,
                         bit: job.bit,
                         area: job.area,
+                        timeline: job.timeline,
                       })
                     }
                   >

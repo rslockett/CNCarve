@@ -13,12 +13,14 @@ import {
   type Board,
   type Oriented,
 } from "@/lib/relief/fit";
-import type { BitShape, ReliefResult } from "@/lib/relief/reliefCam";
-import type { ReliefWorkerMessage, ReliefWorkerRequest } from "@/lib/relief/relief.worker";
+import type { BitShape } from "@/lib/relief/reliefCam";
+import type { ReliefWorkerMessage, ReliefWorkerRequest, TimedResult } from "@/lib/relief/relief.worker";
 import { deriveReliefSettings } from "@/lib/relief/settings";
 import { PROVER_PRESET } from "@/lib/presets/prover";
 import { parseBinaryStl, scaleVertices } from "@/lib/stl";
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
+import { loadFactor, loadMotion } from "@/lib/carveTime";
+import { PROVER_MOTION } from "@/lib/relief/motionTime";
 import { MachineBar } from "./MachineBar";
 import { MachineStep } from "./MachineStep";
 import { ReliefPreview } from "./ReliefPreview";
@@ -56,7 +58,7 @@ type Toolpaths =
   | { kind: "idle" }
   | { kind: "running"; fraction: number; label: string }
   | { kind: "error"; message: string }
-  | { kind: "done"; key: string; result: ReliefResult; bitLabel: string; spindleS: number; bit: BitShape };
+  | { kind: "done"; key: string; result: TimedResult; bitLabel: string; spindleS: number; bit: BitShape };
 
 export function SimpleCarve() {
   const [prefs, setPrefs] = useState<Prefs>(DEFAULT_PREFS);
@@ -77,6 +79,21 @@ export function SimpleCarve() {
   }, [prefs, prefsLoaded]);
 
   const [machine] = useState(() => new CarveMachine());
+  // Machine speed settings: read live when connected, otherwise the ones remembered on this device.
+  const machineMotion = useSyncExternalStore(machine.subscribe, () => machine.getState().motion, () => null);
+  const [stored, setStored] = useState<{ motion: typeof PROVER_MOTION; fromMachine: boolean }>({
+    motion: PROVER_MOTION,
+    fromMachine: false,
+  });
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setStored(loadMotion());
+  }, [machineMotion]);
+  const motion = machineMotion ?? stored.motion;
+  const motionKnown = !!machineMotion || stored.fromMachine;
+  // What real carves on this machine took compared with the prediction (1 = no correction yet).
+  const learned = useSyncExternalStore(noopSubscribe, () => loadFactor()?.factor ?? 0, () => 0);
+  const factor = learned || 1;
   const [design, setDesign] = useState<Design | null>(null);
   const [fileError, setFileError] = useState<string | null>(null);
   const [loadingFile, setLoadingFile] = useState(false);
@@ -116,7 +133,7 @@ export function SimpleCarve() {
   );
 
   const key = design && sized && settings
-    ? [design.name, design.turned, sized.x.toFixed(2), sized.y.toFixed(2), JSON.stringify(prefs.board), JSON.stringify(settings.params), JSON.stringify(settings.bit)].join("|")
+    ? [design.name, design.turned, sized.x.toFixed(2), sized.y.toFixed(2), JSON.stringify(prefs.board), JSON.stringify(settings.params), JSON.stringify(settings.bit), JSON.stringify(motion)].join("|")
     : null;
 
   // Make toolpaths automatically once everything fits (short pause so typing doesn't restart it).
@@ -153,6 +170,7 @@ export function SimpleCarve() {
         params: settings.params,
         board: { widthMm: prefs.board.widthMm, depthMm: prefs.board.lengthMm, thicknessMm: prefs.board.thicknessMm },
         name: design.name,
+        motion,
       };
       w.postMessage(req, [req.vertices.buffer]);
     }, 700);
@@ -169,6 +187,7 @@ export function SimpleCarve() {
         bitLabel: current.bitLabel,
         spindleS: current.spindleS,
         bit: current.bit,
+        timeline: current.result.program.timeline,
         area: {
           minX: current.result.summary.workMinX,
           maxX: current.result.summary.workMaxX,
@@ -349,7 +368,7 @@ export function SimpleCarve() {
             n={4}
             title="Toolpaths"
             done={step4}
-            summary={current ? `about ${minutesText(current.result.program.estMinutes)} of carving` : undefined}
+            summary={current ? `about ${minutesText(current.result.program.estMinutes * factor)} of carving` : undefined}
             open={step3}
           >
             <div className="mb-3 flex flex-wrap items-center gap-2 text-xs text-slate-400">
@@ -381,7 +400,7 @@ export function SimpleCarve() {
                   <ReliefPreview preview={current.result.preview} which="target" label="Your design" />
                   <ReliefPreview preview={current.result.preview} which="carved" label="What your bit will carve" />
                 </div>
-                {current.result.program.estMinutes > 240 && (
+                {current.result.program.estMinutes * factor > 240 && (
                   <p className="text-xs text-amber-200">
                     That&apos;s a long carve. Carving time grows with the area, so a slightly smaller size is much
                     faster — change the height in step 3.
@@ -389,8 +408,15 @@ export function SimpleCarve() {
                 )}
                 {current.result.summary.problems.length === 0 ? (
                   <p className="rounded-xl border border-emerald-500/30 bg-emerald-950/30 p-3 text-sm text-emerald-100">
-                    ✓ Ready: about {minutesText(current.result.program.estMinutes)} of carving in one go, with a{" "}
-                    {current.bitLabel}. Checked for the machine, and the bit never cuts into the design.
+                    ✓ Ready: about {minutesText(current.result.program.estMinutes * factor)} of carving in one go,
+                    with a {current.bitLabel}. Checked for the machine, and the bit never cuts into the design.
+                    <span className="mt-1 block text-xs text-emerald-200/70">
+                      {!motionKnown
+                        ? "Connect the machine once and this time will be worked out from its own speed settings."
+                        : learned
+                          ? "Worked out from your machine's speed settings and corrected by how long your carves really take."
+                          : "Worked out from your machine's speed settings. It gets more exact after each carve."}
+                    </span>
                   </p>
                 ) : (
                   <ul className="space-y-1 rounded-xl border border-rose-500/40 bg-rose-950/40 p-3 text-sm text-rose-100">
@@ -412,6 +438,8 @@ export function SimpleCarve() {
     </div>
   );
 }
+
+const noopSubscribe = () => () => {};
 
 function minutesText(min: number) {
   const m = Math.max(1, Math.round(min));
