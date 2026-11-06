@@ -4,7 +4,7 @@
  * record in localStorage that is updated every few lines.
  */
 
-import type { CarveSection } from "./relief/reliefCam";
+import type { BitShape, CarveSection } from "./relief/reliefCam";
 
 export type SavedCarve = {
   id: string;
@@ -21,6 +21,9 @@ export type SavedCarve = {
   /** Where zero was (machine coordinates, from `$#`) when carving started. */
   g54: { x: number; y: number; z: number } | null;
   startedAt: number;
+  /** Bit shape and machined area — used by the live carving view (older saves may lack them). */
+  bit?: BitShape;
+  area?: { minX: number; maxX: number; minY: number; maxY: number };
 };
 
 export type CarveProgress = {
@@ -29,6 +32,11 @@ export type CarveProgress = {
   lastAcked: number;
   updatedAt: number;
   finished: boolean;
+  /**
+   * Set when the carve was paused on purpose: the exact segment start to resume from. The bit
+   * had finished the previous segment and lifted, so nothing is skipped and nothing re-cut.
+   */
+  resumeAt?: number;
 };
 
 const DB = "cncarve";
@@ -124,6 +132,12 @@ export function chooseRestartLine(carve: SavedCarve, lastAcked: number): number 
     else break;
   }
   return best;
+}
+
+/** Where a saved carve will restart: the exact pause point if it was paused, else a safe backup. */
+export function restartLineFor(carve: SavedCarve, p: CarveProgress | null): number {
+  if (p?.resumeAt !== undefined && carve.restartPoints.includes(p.resumeAt)) return p.resumeAt;
+  return chooseRestartLine(carve, p?.lastAcked ?? -1);
 }
 
 export function sectionAt(sections: CarveSection[], line: number): CarveSection | null {

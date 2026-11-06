@@ -9,14 +9,23 @@
  *  - Restarts happen at a segment start well before the last acknowledged line (GRBL acks lines
  *    when it queues them, not when it cuts them). Segments begin at a safe height, so the only
  *    thing needed before restarting is "spindle on" — no guessing the machine's state.
+ *
+ * Pause: stops sending at the next segment start, lets the machine finish the pass it is on,
+ * lifts the bit and turns the spindle off, then saves the exact line to resume from. Nothing is
+ * left in GRBL's queue, so a sleeping computer, a USB drop or a power cut while paused loses
+ * nothing: Resume (or Continue after re-homing) starts at that exact segment.
+ *
+ * Emergency stop: feed hold + soft reset — motion and spindle stop at once — and the job is
+ * cancelled. The machine must be homed again afterwards.
  */
 
 import { checkMachineSettings, type MachineCheckItem } from "./machineCheck";
 import { GrblSerial, parseGrblGcodeLines } from "./grblSerial";
+import type { BitShape } from "./relief/reliefCam";
 import {
-  chooseRestartLine,
   clearCarve,
   loadProgress,
+  restartLineFor,
   saveCarve,
   saveProgress,
   sectionAt,
@@ -36,6 +45,12 @@ export type Busy =
   | "restarting"
   | "stopping";
 
+/** What the caller passes to start a carve. */
+export type NewCarve = Omit<SavedCarve, "g54" | "startedAt"> & {
+  bit?: BitShape;
+  area?: SavedCarve["area"];
+};
+
 export type Notice = { tone: "info" | "good" | "warn" | "bad"; text: string };
 
 export type MachineState = {
@@ -49,7 +64,14 @@ export type MachineState = {
   wpos: Pos | null;
   settings: MachineCheckItem[] | null;
   busy: Busy;
+  /** Parked: bit lifted, spindle off, resume point saved. */
   paused: boolean;
+  /** Pause requested; finishing the current pass. */
+  pausing: boolean;
+  /** The carve being run or paused right now (null otherwise). */
+  carve: SavedCarve | null;
+  /** The carve that just finished, kept so its picture stays on screen until dismissed. */
+  finishedCarve: SavedCarve | null;
   progress: null | {
     line: number;
     total: number;
@@ -88,9 +110,19 @@ export class CarveMachine {
     settings: null,
     busy: null,
     paused: false,
+    pausing: false,
+    carve: null,
+    finishedCarve: null,
     progress: null,
     notice: null,
   };
+  /** Pause plumbing: requested flag, next line to send, and the waiter Resume releases. */
+  private pauseRequested = false;
+  private nextLine = 0;
+  private resumeWaiter: { resolve: () => void; reject: (e: Error) => void } | null = null;
+  private pollTick = 0;
+  /** Set before an emergency stop touches the machine, so the carve loop knows to cancel. */
+  private emergency = false;
 
   // ---- store plumbing (useSyncExternalStore) ----
   subscribe = (fn: () => void) => {
@@ -159,13 +191,18 @@ export class CarveMachine {
   }
 
   private onLost(why: string) {
+    // A dropped port fires more than one signal (port event + stream error); handle it once.
+    if (!this.state.connected) return;
     this.stopPolling();
+    this.resumeWaiter?.reject(new Error("connection lost"));
+    this.resumeWaiter = null;
     const wasCarving = this.state.busy === "carving" || this.state.busy === "restarting";
     this.set({
       connected: false,
       status: "",
       homed: false,
       paused: false,
+      pausing: false,
       wpos: null,
       busy: wasCarving ? this.state.busy : null,
     });
@@ -182,13 +219,15 @@ export class CarveMachine {
     this.lastStatusAt = Date.now();
     this.poll = window.setInterval(() => {
       if (!this.state.connected) return;
-      void this.serial.sendRealtime("?").catch(() => {});
       const carving = this.state.busy === "carving";
+      // Ask for position 4×/s while carving (smooth live view), about 1×/s otherwise.
+      this.pollTick++;
+      if (carving || this.pollTick % 3 === 0) void this.serial.sendRealtime("?").catch(() => {});
       if (carving && !this.state.paused && Date.now() - this.lastStatusAt > SILENCE_LIMIT_MS) {
         this.abort = true;
         this.say("bad", "The machine stopped answering. Your progress is saved — check the USB cable and power, then Continue carving.");
       }
-    }, 700);
+    }, 250);
   }
   private stopPolling() {
     if (this.poll !== null) window.clearInterval(this.poll);
@@ -269,8 +308,13 @@ export class CarveMachine {
     }
   }
 
+  /** Jogging is allowed when idle, and while a carve is paused (Resume lifts back first). */
+  canJog() {
+    return canJogIn(this.state);
+  }
+
   async jog(axis: "X" | "Y" | "Z", mm: number) {
-    if (!this.idle()) return;
+    if (!this.canJog()) return;
     try {
       const feed = axis === "Z" ? 300 : 1000;
       await this.serial.sendCommand(`$J=G91 G21 ${axis}${mm.toFixed(3)} F${feed}`);
@@ -348,7 +392,7 @@ export class CarveMachine {
   }
 
   // ---- carving ----
-  async startCarve(c: Omit<SavedCarve, "g54" | "startedAt">) {
+  async startCarve(c: NewCarve) {
     if (!this.idle()) return;
     if (!this.state.homed || !this.state.xyZeroSet || !this.state.zZeroSet) {
       this.say("warn", "Home the machine and set zero first.");
@@ -411,7 +455,8 @@ export class CarveMachine {
       this.set({ xyZeroSet: true, zZeroSet: true, traced: true });
 
       const p = loadProgress(c.id);
-      const from = chooseRestartLine(c, p?.lastAcked ?? -1);
+      // A deliberate pause saved the exact segment to resume from; otherwise back up safely.
+      const from = restartLineFor(c, p);
       // After homing the bit is at the top; the restart segment moves over, then down.
       const preamble = ["G21 G90 G17 G94", "G54", `M3 S${c.spindleS}`, "G4 P4"];
       for (const cmd of preamble) await this.serial.sendCommand(cmd, 30_000);
@@ -425,11 +470,16 @@ export class CarveMachine {
 
   private async run(c: SavedCarve, fromLine: number, restoredZero = false) {
     this.abort = false;
+    this.pauseRequested = false;
     const total = c.lineCount;
     const startedAt = Date.now();
+    const restartSet = new Set(c.restartPoints);
     this.set({
       busy: "carving",
       paused: false,
+      pausing: false,
+      carve: c,
+      finishedCarve: null,
       progress: { line: fromLine, total, section: sectionAt(c.sections, fromLine)?.label ?? "", startedAt, fromLine },
       notice:
         fromLine > 0
@@ -443,42 +493,87 @@ export class CarveMachine {
     const onBeforeUnload = (e: BeforeUnloadEvent) => e.preventDefault();
     window.addEventListener("beforeunload", onBeforeUnload);
     let lastSaved = -1;
+    let from = fromLine;
     try {
       // Sanity: the line numbering the restart points use must match what will be streamed.
       if (parseGrblGcodeLines(c.gcode).length !== total) throw new Error("program line count mismatch");
-      await this.serial.streamGcode(
-        c.gcode,
-        (i, t) => {
-          const lastAcked = i - 1;
-          if (lastAcked - lastSaved >= 20 || i === t) {
-            saveProgress({ id: c.id, lastAcked, updatedAt: Date.now(), finished: false });
-            lastSaved = lastAcked;
-          }
-          if (i % 10 === 0 || i === t)
-            this.set({
-              progress: {
-                line: i,
-                total: t,
-                section: sectionAt(c.sections, i)?.label ?? "",
-                startedAt,
-                fromLine,
-              },
-            });
-        },
-        () => this.abort,
-        { startIndex: fromLine, perLineTimeoutMs: PER_LINE_TIMEOUT_MS },
-      );
-      if (this.abort) throw new Error("stopped");
+      for (;;) {
+        this.nextLine = from;
+        await this.serial.streamGcode(
+          c.gcode,
+          (i, t) => {
+            this.nextLine = i;
+            const lastAcked = i - 1;
+            if (lastAcked - lastSaved >= 20 || i === t) {
+              saveProgress({ id: c.id, lastAcked, updatedAt: Date.now(), finished: false });
+              lastSaved = lastAcked;
+            }
+            if (i % 10 === 0 || i === t)
+              this.set({
+                progress: {
+                  line: i,
+                  total: t,
+                  section: sectionAt(c.sections, i)?.label ?? "",
+                  startedAt,
+                  fromLine,
+                },
+              });
+          },
+          // Stop sending for a pause only at a segment start: the previous segment ended by lifting.
+          () => this.abort || (this.pauseRequested && restartSet.has(this.nextLine)),
+          { startIndex: from, perLineTimeoutMs: PER_LINE_TIMEOUT_MS },
+        );
+        if (this.abort) throw new Error("stopped");
+        if (!(this.pauseRequested && this.nextLine < total)) break; // finished
+
+        // ---- park ----
+        const resumeAt = this.nextLine;
+        saveProgress({ id: c.id, lastAcked: resumeAt - 1, updatedAt: Date.now(), finished: false, resumeAt });
+        await this.waitForIdle(120_000);
+        await this.serial.sendCommand("G90");
+        await this.serial.sendCommand("G0 Z5");
+        await this.serial.sendCommand("M5");
+        await this.waitForIdle(30_000);
+        this.set({
+          paused: true,
+          pausing: false,
+          notice: {
+            tone: "info",
+            text: "Paused. The bit is lifted and the spindle is off. Your place is saved — even if the computer sleeps or the power goes out, nothing is lost.",
+          },
+        });
+        void this.unlockScreen();
+
+        // ---- wait for Resume (rejects on emergency stop or a lost connection) ----
+        await new Promise<void>((resolve, reject) => {
+          this.resumeWaiter = { resolve, reject };
+        });
+        this.resumeWaiter = null;
+
+        // ---- resume: lift (in case it was jogged), spindle on, carry on at the saved segment ----
+        this.set({ notice: { tone: "info", text: "Resuming — spindle starting…" } });
+        await this.lockScreen();
+        for (const cmd of ["G90", "G0 Z5", `M3 S${c.spindleS}`, "G4 P4"]) await this.serial.sendCommand(cmd, 30_000);
+        this.pauseRequested = false;
+        saveProgress({ id: c.id, lastAcked: resumeAt - 1, updatedAt: Date.now(), finished: false });
+        lastSaved = resumeAt - 1;
+        from = resumeAt;
+        this.set({ paused: false, notice: null });
+      }
       saveProgress({ id: c.id, lastAcked: total - 1, updatedAt: Date.now(), finished: true });
       await clearCarve();
-      this.set({ busy: null, paused: false, progress: null });
+      this.set({ busy: null, paused: false, pausing: false, carve: null, finishedCarve: c, progress: null });
       this.say("good", "Carving finished! Vacuum the chips, then saw along the groove around the design.");
     } catch (e) {
-      const wasStop = this.state.busy === "stopping";
-      this.set({ busy: null, paused: false });
-      if (wasStop)
-        this.say("info", "Stopped. Your progress is saved — press Continue carving whenever you're ready.");
-      else if (!this.state.notice || this.state.notice.tone !== "bad")
+      const wasStop = this.emergency;
+      this.emergency = false;
+      this.pauseRequested = false;
+      this.set({ busy: null, paused: false, pausing: false, carve: null });
+      if (wasStop) {
+        await clearCarve();
+        this.set({ progress: null });
+        this.say("info", "Stopped. The carving was cancelled. Home the machine before doing anything else.");
+      } else if (!this.state.notice || this.state.notice.tone !== "bad")
         this.say("bad", `Carving stopped (${short(e)}). Your progress is saved — press Continue carving.`);
     } finally {
       window.removeEventListener("beforeunload", onBeforeUnload);
@@ -486,31 +581,74 @@ export class CarveMachine {
     }
   }
 
+  /** Wait until GRBL reports Idle (its queue is empty and the machine has stopped moving). */
+  private async waitForIdle(timeoutMs: number) {
+    const until = Date.now() + timeoutMs;
+    // Make sure the status we read is fresh, not from before the last command.
+    await new Promise((r) => setTimeout(r, 300));
+    while (Date.now() < until) {
+      if (!this.state.connected) throw new Error("connection lost");
+      if (this.abort) throw new Error("stopped");
+      await this.serial.sendRealtime("?").catch(() => {});
+      await new Promise((r) => setTimeout(r, 250));
+      if (this.state.status === "Idle") return;
+    }
+    throw new Error("the machine didn't come to a stop");
+  }
+
+  /** Hide the finished carving's picture. */
+  dismissFinished() {
+    this.set({ finishedCarve: null, notice: null });
+  }
+
+  /** Pause: finish the current pass, lift, spindle off, save the exact place. */
   async pause() {
-    if (this.state.busy !== "carving" || this.state.paused) return;
-    await this.serial.sendRealtime("!").catch(() => {});
-    this.set({ paused: true, notice: { tone: "info", text: "Paused. The spindle keeps spinning; press Resume to carry on." } });
+    if (this.state.busy !== "carving" || this.state.paused || this.state.pausing) return;
+    this.pauseRequested = true;
+    this.set({ pausing: true, notice: { tone: "info", text: "Pausing — finishing this pass, then lifting the bit…" } });
   }
 
   async resume() {
-    if (!this.state.paused) return;
-    await this.serial.sendRealtime("~").catch(() => {});
-    this.set({ paused: false, notice: null });
+    if (this.state.paused && this.resumeWaiter) {
+      this.resumeWaiter.resolve();
+      return;
+    }
+    // A pause was requested but hasn't taken effect yet: just cancel it.
+    if (this.state.pausing) {
+      this.pauseRequested = false;
+      this.set({ pausing: false, notice: null });
+    }
   }
 
-  /** Stop now: hold, then reset (stops spindle and motion). Position must be re-found by homing. */
-  async stop() {
-    if (this.state.busy !== "carving") return;
-    this.set({ busy: "stopping" });
+  /**
+   * Emergency stop: motion and spindle stop at once (feed hold + soft reset). Any carve that is
+   * running or paused is cancelled. The machine has to be homed again afterwards.
+   */
+  async emergencyStop() {
+    if (!this.state.connected) return;
+    const carving = this.state.busy === "carving";
+    // Flag first: the reset below makes the carve loop end straight away.
+    this.emergency = carving;
     this.abort = true;
+    this.pauseRequested = false;
+    if (carving) this.set({ busy: "stopping" });
     try {
       await this.serial.sendRealtime("!");
-      await new Promise((r) => setTimeout(r, 400));
       await this.serial.softReset();
     } catch {
       /* connection may already be gone */
     }
-    this.set({ homed: false });
+    this.set({ homed: false, traced: false });
+    if (carving) {
+      // If parked, nothing is streaming: release the waiter so the carve loop ends and cleans up.
+      if (this.resumeWaiter) {
+        this.resumeWaiter.reject(new Error("stopped"));
+        this.resumeWaiter = null;
+      }
+    } else {
+      this.set({ busy: null });
+      this.say("info", "Stopped. Home the machine before doing anything else.");
+    }
   }
 
   private async lockScreen() {
@@ -528,6 +666,11 @@ export class CarveMachine {
     }
     this.wakeLock = null;
   }
+}
+
+/** Pure check on a state snapshot (use this in React so the answer is never cached). */
+export function canJogIn(s: MachineState): boolean {
+  return s.connected && (s.busy === null || (s.paused && !s.pausing));
 }
 
 function short(e: unknown): string {

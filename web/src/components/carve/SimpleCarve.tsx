@@ -13,12 +13,13 @@ import {
   type Board,
   type Oriented,
 } from "@/lib/relief/fit";
-import type { ReliefResult } from "@/lib/relief/reliefCam";
+import type { BitShape, ReliefResult } from "@/lib/relief/reliefCam";
 import type { ReliefWorkerMessage, ReliefWorkerRequest } from "@/lib/relief/relief.worker";
 import { deriveReliefSettings } from "@/lib/relief/settings";
 import { PROVER_PRESET } from "@/lib/presets/prover";
 import { parseBinaryStl, scaleVertices } from "@/lib/stl";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { MachineBar } from "./MachineBar";
 import { MachineStep } from "./MachineStep";
 import { ReliefPreview } from "./ReliefPreview";
 
@@ -55,7 +56,7 @@ type Toolpaths =
   | { kind: "idle" }
   | { kind: "running"; fraction: number; label: string }
   | { kind: "error"; message: string }
-  | { kind: "done"; key: string; result: ReliefResult; bitLabel: string; spindleS: number };
+  | { kind: "done"; key: string; result: ReliefResult; bitLabel: string; spindleS: number; bit: BitShape };
 
 export function SimpleCarve() {
   const [prefs, setPrefs] = useState<Prefs>(DEFAULT_PREFS);
@@ -134,7 +135,14 @@ export function SimpleCarve() {
           setTp({ kind: "error", message: m.message });
           w.terminate();
         } else {
-          setTp({ kind: "done", key, result: m.result, bitLabel: settings.bitLabel, spindleS: settings.params.spindleS });
+          setTp({
+            kind: "done",
+            key,
+            result: m.result,
+            bitLabel: settings.bitLabel,
+            spindleS: settings.params.spindleS,
+            bit: settings.bit,
+          });
           w.terminate();
         }
       };
@@ -155,7 +163,19 @@ export function SimpleCarve() {
 
   const current = tp.kind === "done" && tp.key === key ? tp : null;
   const job = current
-    ? { ...current.result.program, name: design?.name ?? "carving", bitLabel: current.bitLabel, spindleS: current.spindleS }
+    ? {
+        ...current.result.program,
+        name: design?.name ?? "carving",
+        bitLabel: current.bitLabel,
+        spindleS: current.spindleS,
+        bit: current.bit,
+        area: {
+          minX: current.result.summary.workMinX,
+          maxX: current.result.summary.workMaxX,
+          minY: current.result.summary.workMinY,
+          maxY: current.result.summary.workMaxY,
+        },
+      }
     : null;
 
   const onFile = async (f: File | undefined) => {
@@ -194,14 +214,17 @@ export function SimpleCarve() {
 
   return (
     <div className="h-full overflow-y-auto bg-slate-950 text-slate-100">
-      <div className="mx-auto max-w-2xl px-4 pb-24 pt-6">
+      <div className="mx-auto max-w-2xl px-4 pb-40 pt-6">
         <header className="mb-6 flex items-start justify-between gap-4">
           <div>
             <h1 className="text-2xl font-semibold text-white">CNCarve</h1>
             <p className="text-sm text-slate-400">Carve a relief on the 3018 in five steps.</p>
           </div>
-          <Link href="/advanced" className="mt-1 text-xs text-slate-500 underline hover:text-slate-300">
-            Advanced (Kiri:Moto)
+          <Link
+            href="/advanced"
+            className="shrink-0 rounded-lg border border-white/15 bg-slate-900 px-3 py-2 text-xs font-medium text-slate-200 hover:border-teal-500/60 hover:text-white"
+          >
+            Advanced (Kiri:Moto) →
           </Link>
         </header>
 
@@ -385,6 +408,7 @@ export function SimpleCarve() {
           </Card>
         </div>
       </div>
+      <MachineBar machine={machine} />
     </div>
   );
 }
