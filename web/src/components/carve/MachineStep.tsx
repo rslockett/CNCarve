@@ -1,15 +1,43 @@
 "use client";
 
 import { CarveMachine, type MachineState } from "@/lib/carveMachine";
-import { chooseRestartLine, clearCarve, loadCarve, loadProgress, type SavedCarve } from "@/lib/carveStore";
-import type { CarveProgram } from "@/lib/relief/reliefCam";
+import { clearCarve, loadCarve, loadProgress, restartLineFor, type SavedCarve } from "@/lib/carveStore";
+import type { BitShape, CarveProgram } from "@/lib/relief/reliefCam";
+import { JogPad } from "./JogPad";
+import { LiveCarveView } from "./LiveCarveView";
+import { SpeedCheck } from "./SpeedCheck";
+import { loadFactor } from "@/lib/carveTime";
 import { useCallback, useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
 
 type Props = {
   machine: CarveMachine;
   /** The carve made in step 4 (null until toolpaths exist). */
-  job: (CarveProgram & { name: string; bitLabel: string; spindleS: number }) | null;
+  job:
+    | (CarveProgram & {
+        name: string;
+        bitLabel: string;
+        spindleS: number;
+        bit: BitShape;
+        area: { minX: number; maxX: number; minY: number; maxY: number };
+        timeline: number[];
+      })
+    | null;
 };
+
+const DEFAULT_BIT: BitShape = { type: "vee", halfAngleDeg: 10, tipDiameterMm: 0.1, diameterMm: 3.175 };
+
+/** Machined area from the program itself (for carves saved before the area was stored). */
+function areaFromGcode(gcode: string) {
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const m of gcode.matchAll(/^G1 X(-?[\d.]+) Y(-?[\d.]+)/gm)) {
+    const x = Number(m[1]), y = Number(m[2]);
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+  }
+  return Number.isFinite(minX) ? { minX, maxX, minY, maxY } : { minX: -20, maxX: 20, minY: -20, maxY: 20 };
+}
 
 const TONE: Record<string, string> = {
   info: "border-sky-500/40 bg-sky-950/40 text-sky-100",
@@ -40,6 +68,8 @@ export function MachineStep({ machine, job }: Props) {
   const s: MachineState = useSyncExternalStore(machine.subscribe, machine.getState, machine.getState);
   // USB support can only be known in the browser; the server render assumes it's there.
   const supported = useSyncExternalStore(noopSubscribe, () => machine.isSupported(), () => true);
+  // Learned time correction, read fresh each render (not cached by the compiler).
+  const timeFactor = useSyncExternalStore(noopSubscribe, () => loadFactor()?.factor ?? 1, () => 1);
   const [saved, setSaved] = useState<SavedCarve | null>(null);
   const [jogStep, setJogStep] = useState(1);
   const [probeMode, setProbeMode] = useState(false);
@@ -50,7 +80,6 @@ export function MachineStep({ machine, job }: Props) {
       return 0;
     }
   });
-  const [confirmStop, setConfirmStop] = useState(false);
 
   const refreshSaved = useCallback(() => {
     void loadCarve().then(setSaved);
@@ -87,61 +116,47 @@ export function MachineStep({ machine, job }: Props) {
   // ---------- while carving ----------
   if (carving && s.progress) {
     const p = s.progress;
-    const src = saved && saved.lineCount === p.total ? saved : job && job.lineCount === p.total ? job : null;
+    const src = s.carve ?? (saved && saved.lineCount === p.total ? saved : job && job.lineCount === p.total ? job : null);
     const est = src?.estMinutes ?? 0;
     const sectionMinutes = src?.sectionMinutes ?? null;
     const done = src && sectionMinutes ? minutesDone({ sections: src.sections, sectionMinutes, lineCount: src.lineCount }, p.line) : 0;
     const pct = Math.min(100, (100 * p.line) / Math.max(1, p.total));
+    const carve = s.carve;
     return (
       <div className="space-y-4">
+        {carve && (
+          <LiveCarveView
+            carveId={carve.id}
+            gcode={carve.gcode}
+            bit={carve.bit ?? DEFAULT_BIT}
+            area={carve.area ?? areaFromGcode(carve.gcode)}
+            line={p.line}
+            wpos={s.wpos}
+            paused={s.paused}
+          />
+        )}
         <div>
           <div className="flex items-baseline justify-between text-sm">
-            <span className="font-semibold text-white">{s.paused ? "Paused" : p.section || "Carving"}</span>
+            <span className="font-semibold text-white">
+              {s.paused ? "Paused" : s.pausing ? "Pausing…" : s.busy === "stopping" ? "Stopping…" : p.section || "Carving"}
+            </span>
             <span className="text-slate-300">{pct.toFixed(0)}%</span>
           </div>
           <div className="mt-2 h-3 overflow-hidden rounded-full bg-slate-800">
             <div className="h-full bg-gradient-to-r from-teal-500 to-emerald-500 transition-[width]" style={{ width: `${pct}%` }} />
           </div>
-          {est > 0 && sectionMinutes && (
-            <p className="mt-1.5 text-xs text-slate-400">About {minutesText(est - done)} left</p>
+          {p.etaMinutes !== null ? (
+            <p className="mt-1.5 text-xs text-slate-400">About {minutesText(p.etaMinutes)} left</p>
+          ) : (
+            est > 0 &&
+            sectionMinutes && <p className="mt-1.5 text-xs text-slate-400">About {minutesText(est - done)} left</p>
           )}
         </div>
         {s.notice && <p className={`rounded-xl border p-3 text-sm ${TONE[s.notice.tone]}`}>{s.notice.text}</p>}
-        <div className="flex flex-wrap gap-2">
-          {s.paused ? (
-            <button type="button" className={primary} onClick={() => void machine.resume()}>
-              Resume
-            </button>
-          ) : (
-            <button type="button" className={secondary} onClick={() => void machine.pause()}>
-              Pause
-            </button>
-          )}
-          {confirmStop ? (
-            <>
-              <button
-                type="button"
-                className={`${btn} bg-rose-600 text-white`}
-                onClick={() => {
-                  setConfirmStop(false);
-                  void machine.stop();
-                }}
-              >
-                Yes, stop now
-              </button>
-              <button type="button" className={secondary} onClick={() => setConfirmStop(false)}>
-                Keep carving
-              </button>
-            </>
-          ) : (
-            <button type="button" className={`${btn} border border-rose-500/50 text-rose-200`} onClick={() => setConfirmStop(true)}>
-              Stop
-            </button>
-          )}
-        </div>
+        <CarveControls machine={machine} s={s} size="large" />
         <p className="text-xs text-slate-500">
-          Keep this page open. If anything interrupts the carve, your progress is saved and you can continue
-          from where it stopped.
+          Pause finishes the pass it&apos;s on, lifts the bit and turns the spindle off — your place is kept
+          even if the computer sleeps or the power goes out. STOP is for emergencies and cancels the job.
         </p>
       </div>
     );
@@ -150,6 +165,29 @@ export function MachineStep({ machine, job }: Props) {
   // ---------- setup checklist ----------
   return (
     <div className="space-y-4">
+      {s.finishedCarve && (
+        <div className="space-y-3 rounded-xl border border-emerald-500/30 bg-emerald-950/20 p-3">
+          <LiveCarveView
+            carveId={`${s.finishedCarve.id}-done`}
+            gcode={s.finishedCarve.gcode}
+            bit={s.finishedCarve.bit ?? DEFAULT_BIT}
+            area={s.finishedCarve.area ?? areaFromGcode(s.finishedCarve.gcode)}
+            line={s.finishedCarve.lineCount + 100}
+            wpos={null}
+            paused
+          />
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-sm font-semibold text-emerald-100">Finished: {s.finishedCarve.name}</p>
+            <button
+              type="button"
+              className={secondary}
+              onClick={() => machine.dismissFinished()}
+            >
+              Done
+            </button>
+          </div>
+        </div>
+      )}
       {unfinished && saved && (
         <div className={`rounded-xl border p-3 text-sm ${TONE.warn}`}>
           <p className="font-semibold">
@@ -189,13 +227,15 @@ export function MachineStep({ machine, job }: Props) {
           </div>
           {saved && progress && (
             <p className="mt-1.5 text-[11px] text-amber-100/60">
-              Restarts at line {chooseRestartLine(saved, progress.lastAcked) + 1} of {saved.lineCount}.
+              Restarts at line {restartLineFor(saved, progress) + 1} of {saved.lineCount}.
             </p>
           )}
         </div>
       )}
 
       {s.notice && <p className={`rounded-xl border p-3 text-sm ${TONE[s.notice.tone]}`}>{s.notice.text}</p>}
+
+      {s.connected && s.speedCheck.phase !== "off" && <SpeedCheck machine={machine} s={s} />}
 
       <ol className="space-y-4">
         <Row n={1} done={s.connected} title="Connect to the 3018 with the USB cable">
@@ -210,6 +250,15 @@ export function MachineStep({ machine, job }: Props) {
                 : settingsProblems.length === 0
                   ? "Machine settings look right."
                   : null}
+              {s.grbl && s.speedCheck.phase === "off" && s.busy === null && (
+                <button
+                  type="button"
+                  onClick={() => machine.openSpeedCheck()}
+                  className={`mt-1.5 rounded-lg px-2.5 py-1 text-xs font-medium ${settingsProblems.some((i) => i.id === "accel") ? "bg-teal-600 text-white" : "border border-white/15 text-slate-300"}`}
+                >
+                  Speed check — carve faster safely
+                </button>
+              )}
               {settingsProblems.map((it) => (
                 <p key={it.id} className={it.status === "problem" ? "text-rose-300" : "text-amber-200"}>
                   {it.status === "problem" ? "✕" : "!"} {it.title}. {it.detail}{" "}
@@ -330,7 +379,7 @@ export function MachineStep({ machine, job }: Props) {
               ) : (
                 <>
                   <p className="mt-1 text-xs text-slate-400">
-                    One continuous carve, about {minutesText(job.estMinutes)}. Turn on dust collection and keep
+                    One continuous carve, about {minutesText(job.estMinutes * timeFactor)}. Turn on dust collection and keep
                     this page open.
                   </p>
                   <button
@@ -349,6 +398,9 @@ export function MachineStep({ machine, job }: Props) {
                         estMinutes: job.estMinutes,
                         sectionMinutes: job.sectionMinutes,
                         spindleS: job.spindleS,
+                        bit: job.bit,
+                        area: job.area,
+                        timeline: job.timeline,
                       })
                     }
                   >
@@ -377,6 +429,48 @@ export function MachineStep({ machine, job }: Props) {
   );
 }
 
+/** Pause / Resume and the emergency STOP. Used in step 5 and in the bar along the bottom. */
+export function CarveControls({ machine, s, size }: { machine: CarveMachine; s: MachineState; size: "large" | "small" }) {
+  const carving = s.busy === "carving";
+  const big = size === "large";
+  const base = `rounded-xl font-semibold disabled:cursor-not-allowed disabled:opacity-40 ${big ? "px-5 py-3 text-sm" : "px-3 py-1.5 text-xs"}`;
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      {carving &&
+        (s.paused || s.pausing ? (
+          <button
+            type="button"
+            className={`${base} bg-gradient-to-r from-teal-500 to-emerald-600 text-white shadow-lg`}
+            onClick={() => void machine.resume()}
+          >
+            {s.pausing ? "Keep going" : "Resume"}
+          </button>
+        ) : (
+          <button type="button" className={`${base} border border-white/20 bg-slate-800 text-white hover:bg-slate-700`} onClick={() => void machine.pause()}>
+            Pause
+          </button>
+        ))}
+      <StopButton machine={machine} s={s} big={big} />
+    </div>
+  );
+}
+
+/** One press, no questions: stops motion and the spindle at once. */
+export function StopButton({ machine, s, big }: { machine: CarveMachine; s: MachineState; big: boolean }) {
+  const jobActive = s.busy === "carving";
+  return (
+    <button
+      type="button"
+      disabled={!s.connected || s.busy === "stopping"}
+      onClick={() => void machine.emergencyStop()}
+      className={`flex flex-col items-center rounded-xl bg-rose-600 font-bold text-white shadow-lg shadow-rose-950/50 ring-2 ring-rose-400/40 hover:bg-rose-500 disabled:opacity-40 ${big ? "px-5 py-2" : "px-3 py-1"}`}
+    >
+      <span className={big ? "text-sm tracking-wider" : "text-xs tracking-wider"}>■ STOP</span>
+      {jobActive && <span className={`font-medium text-rose-100 ${big ? "text-[11px]" : "text-[9px]"}`}>cancels the job</span>}
+    </button>
+  );
+}
+
 function Row({ n, done, title, children }: { n: number; done: boolean; title: string; children?: ReactNode }) {
   return (
     <li className="flex gap-3">
@@ -390,65 +484,5 @@ function Row({ n, done, title, children }: { n: number; done: boolean; title: st
         {children}
       </div>
     </li>
-  );
-}
-
-function JogPad({
-  machine,
-  disabled,
-  step,
-  setStep,
-}: {
-  machine: CarveMachine;
-  disabled: boolean;
-  step: number;
-  setStep: (n: number) => void;
-}) {
-  const b =
-    "h-11 w-11 rounded-lg border border-white/15 bg-slate-800 text-lg text-white hover:bg-slate-700 active:bg-slate-600 disabled:opacity-40";
-  const j = (axis: "X" | "Y" | "Z", dir: 1 | -1) => () => void machine.jog(axis, dir * step);
-  return (
-    <div className="flex flex-wrap items-center gap-4">
-      <div className="grid grid-cols-3 gap-1.5">
-        <span />
-        <button type="button" className={b} disabled={disabled} onClick={j("Y", 1)} aria-label="Move away from you">
-          ↑
-        </button>
-        <span />
-        <button type="button" className={b} disabled={disabled} onClick={j("X", -1)} aria-label="Move left">
-          ←
-        </button>
-        <span className="flex items-center justify-center text-[10px] text-slate-500">bit</span>
-        <button type="button" className={b} disabled={disabled} onClick={j("X", 1)} aria-label="Move right">
-          →
-        </button>
-        <span />
-        <button type="button" className={b} disabled={disabled} onClick={j("Y", -1)} aria-label="Move toward you">
-          ↓
-        </button>
-        <span />
-      </div>
-      <div className="flex flex-col gap-1.5">
-        <button type="button" className={`${b} w-16 text-sm`} disabled={disabled} onClick={j("Z", 1)}>
-          Up
-        </button>
-        <button type="button" className={`${b} w-16 text-sm`} disabled={disabled} onClick={j("Z", -1)}>
-          Down
-        </button>
-      </div>
-      <div className="flex flex-col gap-1 text-xs text-slate-300">
-        <span className="text-slate-500">Step</span>
-        {[10, 1, 0.1].map((v) => (
-          <button
-            key={v}
-            type="button"
-            onClick={() => setStep(v)}
-            className={`rounded-md px-2 py-1 ${step === v ? "bg-teal-600 text-white" : "bg-slate-800 hover:bg-slate-700"}`}
-          >
-            {v} mm
-          </button>
-        ))}
-      </div>
-    </div>
   );
 }

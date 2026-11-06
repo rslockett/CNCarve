@@ -102,6 +102,21 @@ export function checkMachineSettings(s: GrblSettings): MachineCheckItem[] {
     );
   }
 
+  if (has(120) && has(121)) {
+    const a = Math.min(s[120], s[121]);
+    out.push(
+      a < 20
+        ? {
+            id: "accel",
+            status: "warn",
+            title: `Acceleration is low (${a} mm/s²)`,
+            detail:
+              "Relief carvings are thousands of tiny moves, so the machine spends most of its time speeding up and slowing down. Run the speed check to try a faster setting safely.",
+          }
+        : { id: "accel", status: "ok", title: `Acceleration is ${a} mm/s²`, detail: "Good for relief carving." },
+    );
+  }
+
   if (has(100) && has(101)) {
     out.push(
       Math.abs(s[100] - s[101]) < 1e-6
