@@ -17,6 +17,7 @@ import type { BitShape } from "@/lib/relief/reliefCam";
 import type { ReliefWorkerMessage, ReliefWorkerRequest, TimedResult } from "@/lib/relief/relief.worker";
 import { deriveReliefSettings } from "@/lib/relief/settings";
 import { PROVER_PRESET } from "@/lib/presets/prover";
+import { takePendingDesign } from "@/lib/imageRelief/handoff";
 import { parseBinaryStl, scaleVertices } from "@/lib/stl";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { loadFactor, loadMotion } from "@/lib/carveTime";
@@ -197,7 +198,8 @@ export function SimpleCarve() {
       }
     : null;
 
-  const onFile = async (f: File | undefined) => {
+  /** `designedHeightMm`: the size it was made for (a relief from the picture page). */
+  const onFile = async (f: File | undefined, designedHeightMm?: number) => {
     if (!f) return;
     setFileError(null);
     setLoadingFile(true);
@@ -213,8 +215,9 @@ export function SimpleCarve() {
       // Turn it 90° on the board if that lets it be carved bigger.
       const turned = rotate90(base);
       const autoTurned = largestScale(turned.size, prefs.board) > largestScale(base.size, prefs.board) * 1.02;
-      setDesign({ name: f.name.replace(/\.stl$/i, ""), base, turned: autoTurned, autoTurned });
-      setHeightMm(null);
+      const keepUpright = designedHeightMm !== undefined;
+      setDesign({ name: f.name.replace(/\.stl$/i, ""), base, turned: keepUpright ? false : autoTurned, autoTurned: keepUpright ? false : autoTurned });
+      setHeightMm(designedHeightMm ?? null);
       setTp({ kind: "idle" });
     } catch (e) {
       setDesign(null);
@@ -223,6 +226,18 @@ export function SimpleCarve() {
       setLoadingFile(false);
     }
   };
+
+  // A relief made on the picture page ("Carve this") is waiting: load it like a chosen file.
+  useEffect(() => {
+    let live = true;
+    void takePendingDesign().then((d) => {
+      if (live && d) void onFile(new File([d.stl], `${d.name}.stl`), d.heightMm);
+    });
+    return () => {
+      live = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const setBoard = (patch: Partial<Board>) => setPrefs((p) => ({ ...p, board: { ...p.board, ...patch } }));
 
@@ -239,12 +254,20 @@ export function SimpleCarve() {
             <h1 className="text-2xl font-semibold text-white">CNCarve</h1>
             <p className="text-sm text-slate-400">Carve a relief on the 3018 in five steps.</p>
           </div>
+          <div className="flex shrink-0 flex-col items-end gap-2">
+          <Link
+            href="/relief"
+            className="shrink-0 rounded-lg border border-white/15 bg-slate-900 px-3 py-2 text-xs font-medium text-slate-200 hover:border-teal-500/60 hover:text-white"
+          >
+            Picture to relief →
+          </Link>
           <Link
             href="/advanced"
             className="shrink-0 rounded-lg border border-white/15 bg-slate-900 px-3 py-2 text-xs font-medium text-slate-200 hover:border-teal-500/60 hover:text-white"
           >
             Advanced (Kiri:Moto) →
           </Link>
+          </div>
         </header>
 
         <div className="space-y-4">
@@ -269,6 +292,9 @@ export function SimpleCarve() {
                 onChange={(e) => void onFile(e.target.files?.[0])}
               />
             </label>
+            <p className="mt-2 text-xs text-slate-400">
+              No STL? <Link href="/relief" className="text-teal-300 underline">Make one from a picture</Link>.
+            </p>
             {fileError && <p className="mt-2 text-sm text-rose-300">{fileError}</p>}
             {design?.base.note && <p className="mt-2 text-xs text-slate-400">{design.base.note}</p>}
           </Card>

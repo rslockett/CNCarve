@@ -30,6 +30,28 @@ crosses, plaques) on a 3018-PROVer.
   if it changed), turns the spindle on above the work and restarts at a safe segment start a
   little before where it stopped.
 
+## Picture to relief (`/relief`)
+
+Turns a picture into a relief STL, then **Carve this** opens Simple carve with it loaded at the
+size you chose (or **Download STL** to keep it).
+
+- **Photo / statue:** the shape is worked out by an AI depth model (Depth Anything V2 Small,
+  Apache-2.0) running **on this computer** in the browser — free, no account, nothing uploaded.
+  The model (~100 MB) downloads once from Hugging Face and is cached. Two passes: the overall
+  shape, then a high-resolution pass for lettering and fine borders ("High" detail; "Standard" is
+  faster). Under a minute on a Mac; a few minutes on a Raspberry Pi 4.
+- **Drawing / line art:** brightness becomes height, no AI.
+- **Its own outline:** for a piece photographed on a plain background (white wall, black
+  leather), the piece's outline is found automatically and the background, chains and beads drop
+  away. Rectangle, oval, arch and cross outlines are also available.
+- **Straighten:** detected automatically from the piece's edges, with a slider and grid to adjust.
+  A slight camera tilt is removed from the depth too.
+- **Adjust:** depth (default 3 mm), background, flatten, detail, smooth, base thickness.
+- The STL is a closed solid with an adaptive mesh (detail kept to 0.01 mm), typically 10–25 MB.
+
+Lettering is reproduced from the photo as it is; a sharp, well-lit, straight-on photo gives the
+crispest inscriptions. Code: `web/src/lib/imageRelief/`, `web/src/components/relief/`.
+
 The original Kiri:Moto workspace is at **`/advanced`**. Engine code: `web/src/lib/relief/`;
 machine control: `web/src/lib/carveMachine.ts`, `web/src/lib/carveStore.ts`; screen:
 `web/src/components/carve/`. `web/scripts/relief-cli.ts` runs the engine from the command line.
