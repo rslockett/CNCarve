@@ -2,7 +2,8 @@
 
 import { canJogIn, type CarveMachine, type MachineState } from "@/lib/carveMachine";
 import { useState, useSyncExternalStore } from "react";
-import { CarveControls, JogPad } from "./MachineStep";
+import { JogPad } from "./JogPad";
+import { CarveControls } from "./MachineStep";
 
 const noopSubscribe = () => () => {};
 

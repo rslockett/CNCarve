@@ -25,6 +25,15 @@ import type { BitShape } from "./relief/reliefCam";
 import { motionFromGrbl, type MotionSettings } from "./relief/motionTime";
 import { loadFactor, predictedAt, recordFactor, saveMotion } from "./carveTime";
 import {
+  loadOriginal,
+  originalCommands,
+  rememberOriginal,
+  settingCommands,
+  testPattern,
+  type SpeedSettings,
+  type SpeedTarget,
+} from "./speedCheck";
+import {
   clearCarve,
   loadProgress,
   restartLineFor,
@@ -45,7 +54,16 @@ export type Busy =
   | "tracing"
   | "carving"
   | "restarting"
-  | "stopping";
+  | "stopping"
+  | "speedtest";
+
+/** Where the guided speed check is up to. */
+export type SpeedCheckState = {
+  phase: "off" | "marking" | "testing" | "check" | "kept" | "restored";
+  /** The remembered spot over the pencil dot (machine coordinates). */
+  mark: Pos | null;
+  target: SpeedTarget | null;
+};
 
 /** What the caller passes to start a carve. */
 export type NewCarve = Omit<SavedCarve, "g54" | "startedAt"> & {
@@ -87,6 +105,9 @@ export type MachineState = {
   };
   /** Speed / acceleration settings read from the machine ($$), for time estimates. */
   motion: MotionSettings | null;
+  /** All settings as last read with $$. */
+  grbl: Record<number, number> | null;
+  speedCheck: SpeedCheckState;
   notice: Notice | null;
 };
 
@@ -122,8 +143,14 @@ export class CarveMachine {
     finishedCarve: null,
     progress: null,
     motion: null,
+    grbl: null,
+    speedCheck: { phase: "off", mark: null, target: null },
     notice: null,
   };
+  /** Latest machine position (MPos), for remembering the speed-check spot. */
+  private mpos: Pos | null = null;
+  /** Settings just before the current speed test: a failed test goes back to these. */
+  private beforeTest: SpeedSettings | null = null;
   /** Pause plumbing: requested flag, next line to send, and the waiter Resume releases. */
   private pauseRequested = false;
   private nextLine = 0;
@@ -261,6 +288,8 @@ export class CarveMachine {
       }
       if (!wpos && mpos && this.wco)
         wpos = { x: mpos.x - this.wco.x, y: mpos.y - this.wco.y, z: mpos.z - this.wco.z };
+      if (mpos) this.mpos = mpos;
+      else if (wpos && this.wco) this.mpos = { x: wpos.x + this.wco.x, y: wpos.y + this.wco.y, z: wpos.z + this.wco.z };
       const patch: Partial<MachineState> = {};
       if (status !== this.state.status) patch.status = status;
       if (wpos) patch.wpos = wpos;
@@ -277,7 +306,7 @@ export class CarveMachine {
       if (Object.keys(s).length) {
         const motion = motionFromGrbl(s);
         saveMotion(motion); // remembered on this device so estimates are right before connecting
-        this.set({ settings: checkMachineSettings(s), motion });
+        this.set({ settings: checkMachineSettings(s), motion, grbl: s });
       }
     } catch {
       /* shown as "not checked"; user can retry */
@@ -647,6 +676,116 @@ export class CarveMachine {
       if (this.state.status === "Idle") return;
     }
     throw new Error("the machine didn't come to a stop");
+  }
+
+  // ---- guided speed check ----
+  /** Start the guided check (default: the recommended setting). */
+  openSpeedCheck(target?: SpeedTarget) {
+    this.set({ speedCheck: { phase: "marking", mark: null, target: target ?? null }, notice: null });
+  }
+
+  closeSpeedCheck() {
+    // Closing at the "is it on the dot?" question without answering counts as No:
+    // an untested setting must never stay on the machine.
+    if (this.state.speedCheck.phase === "check") void this.restoreBeforeTest();
+    this.set({ speedCheck: { phase: "off", mark: null, target: null } });
+  }
+
+  /** Run the air test at `target`, ending exactly over the spot the bit is at now. */
+  async runSpeedTest(target: SpeedTarget) {
+    if (!this.idle() || !this.state.homed) {
+      this.say("warn", "Home the machine first.");
+      return;
+    }
+    const g = this.state.grbl;
+    if (!g) {
+      this.say("warn", "The machine's settings haven't been read yet — wait a moment and try again.");
+      return;
+    }
+    // Remember exactly where the bit is (fresh position).
+    await this.serial.sendRealtime("?").catch(() => {});
+    await new Promise((r) => setTimeout(r, 400));
+    const mark = this.mpos;
+    if (!mark) {
+      this.say("bad", "Couldn't read the machine's position. Try again.");
+      return;
+    }
+    const travel = { x: g[130] > 0 ? g[130] : 290, y: g[131] > 0 ? g[131] : 170, z: g[132] > 0 ? g[132] : 40 };
+    let lines: string[];
+    try {
+      lines = testPattern(mark, travel);
+    } catch (e) {
+      this.say("warn", short(e));
+      return;
+    }
+    rememberOriginal(g);
+    this.beforeTest = { 120: g[120], 121: g[121], 122: g[122], 11: g[11] };
+    this.abort = false;
+    this.set({
+      busy: "speedtest",
+      speedCheck: { phase: "testing", mark, target },
+      notice: { tone: "info", text: "Running the speed test in the air (spindle off)…" },
+    });
+    try {
+      for (const cmd of settingCommands(target)) await this.serial.sendCommand(cmd);
+      await this.serial.streamGcode(lines.join("\n"), undefined, () => this.abort, { perLineTimeoutMs: 120_000 });
+      if (this.abort) throw new Error("stopped");
+      await this.waitForIdle(120_000);
+      this.set({ busy: null, speedCheck: { phase: "check", mark, target }, notice: null });
+    } catch (e) {
+      // Anything went wrong (including STOP): put the original settings back. After a STOP the
+      // controller restarts; give it a moment (GRBL accepts $ settings while in alarm).
+      const stopped = this.abort;
+      if (stopped) await new Promise((r) => setTimeout(r, 800));
+      await this.restoreBeforeTest();
+      this.set({ busy: null, speedCheck: { phase: "restored", mark, target } });
+      this.say(
+        "warn",
+        stopped
+          ? "Speed test stopped. Your previous settings are back. Home the machine before doing anything else."
+          : `The speed test didn't finish (${short(e)}). Your previous settings are back.`,
+      );
+    }
+  }
+
+  /** The user's answer: is the tip still exactly over the dot? */
+  async answerSpeedTest(onTheDot: boolean) {
+    const sc = this.state.speedCheck;
+    if (sc.phase !== "check" || !sc.target) return;
+    if (onTheDot) {
+      this.set({ speedCheck: { ...sc, phase: "kept" } });
+      await this.checkSettings();
+      this.say("good", `Kept. The machine now uses ${sc.target.accel} mm/s² — carving times have been updated.`);
+    } else {
+      await this.restoreBeforeTest();
+      this.set({ speedCheck: { ...sc, phase: "restored" } });
+      this.say("info", "Your previous settings are back. The machine is safest at those values.");
+    }
+  }
+
+  /** Go back to the settings in use just before this test (the last ones that worked). */
+  private async restoreBeforeTest() {
+    const b = this.beforeTest;
+    if (!b || !this.state.connected) return;
+    try {
+      for (const cmd of originalCommands(b)) await this.serial.sendCommand(cmd);
+      await this.checkSettings();
+    } catch (e) {
+      this.say("bad", `Couldn't put the previous settings back (${short(e)}). Use "Restore my original speed settings".`);
+    }
+  }
+
+  /** Put the settings from before the first speed check back. */
+  async restoreOriginalSpeed(quiet = false) {
+    const o = loadOriginal();
+    if (!o || !this.state.connected) return;
+    try {
+      for (const cmd of originalCommands(o)) await this.serial.sendCommand(cmd);
+      await this.checkSettings();
+      if (!quiet) this.say("good", "Your original speed settings are back.");
+    } catch (e) {
+      this.say("bad", `Couldn't restore the original settings (${short(e)}).`);
+    }
   }
 
   /** Hide the finished carving's picture. */

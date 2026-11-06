@@ -3,7 +3,9 @@
 import { CarveMachine, type MachineState } from "@/lib/carveMachine";
 import { clearCarve, loadCarve, loadProgress, restartLineFor, type SavedCarve } from "@/lib/carveStore";
 import type { BitShape, CarveProgram } from "@/lib/relief/reliefCam";
+import { JogPad } from "./JogPad";
 import { LiveCarveView } from "./LiveCarveView";
+import { SpeedCheck } from "./SpeedCheck";
 import { loadFactor } from "@/lib/carveTime";
 import { useCallback, useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
 
@@ -233,6 +235,8 @@ export function MachineStep({ machine, job }: Props) {
 
       {s.notice && <p className={`rounded-xl border p-3 text-sm ${TONE[s.notice.tone]}`}>{s.notice.text}</p>}
 
+      {s.connected && s.speedCheck.phase !== "off" && <SpeedCheck machine={machine} s={s} />}
+
       <ol className="space-y-4">
         <Row n={1} done={s.connected} title="Connect to the 3018 with the USB cable">
           {!s.connected ? (
@@ -246,6 +250,15 @@ export function MachineStep({ machine, job }: Props) {
                 : settingsProblems.length === 0
                   ? "Machine settings look right."
                   : null}
+              {s.grbl && s.speedCheck.phase === "off" && s.busy === null && (
+                <button
+                  type="button"
+                  onClick={() => machine.openSpeedCheck()}
+                  className={`mt-1.5 rounded-lg px-2.5 py-1 text-xs font-medium ${settingsProblems.some((i) => i.id === "accel") ? "bg-teal-600 text-white" : "border border-white/15 text-slate-300"}`}
+                >
+                  Speed check — carve faster safely
+                </button>
+              )}
               {settingsProblems.map((it) => (
                 <p key={it.id} className={it.status === "problem" ? "text-rose-300" : "text-amber-200"}>
                   {it.status === "problem" ? "✕" : "!"} {it.title}. {it.detail}{" "}
@@ -471,65 +484,5 @@ function Row({ n, done, title, children }: { n: number; done: boolean; title: st
         {children}
       </div>
     </li>
-  );
-}
-
-export function JogPad({
-  machine,
-  disabled,
-  step,
-  setStep,
-}: {
-  machine: CarveMachine;
-  disabled: boolean;
-  step: number;
-  setStep: (n: number) => void;
-}) {
-  const b =
-    "h-11 w-11 rounded-lg border border-white/15 bg-slate-800 text-lg text-white hover:bg-slate-700 active:bg-slate-600 disabled:opacity-40";
-  const j = (axis: "X" | "Y" | "Z", dir: 1 | -1) => () => void machine.jog(axis, dir * step);
-  return (
-    <div className="flex flex-wrap items-center gap-4">
-      <div className="grid grid-cols-3 gap-1.5">
-        <span />
-        <button type="button" className={b} disabled={disabled} onClick={j("Y", 1)} aria-label="Move away from you">
-          ↑
-        </button>
-        <span />
-        <button type="button" className={b} disabled={disabled} onClick={j("X", -1)} aria-label="Move left">
-          ←
-        </button>
-        <span className="flex items-center justify-center text-[10px] text-slate-500">bit</span>
-        <button type="button" className={b} disabled={disabled} onClick={j("X", 1)} aria-label="Move right">
-          →
-        </button>
-        <span />
-        <button type="button" className={b} disabled={disabled} onClick={j("Y", -1)} aria-label="Move toward you">
-          ↓
-        </button>
-        <span />
-      </div>
-      <div className="flex flex-col gap-1.5">
-        <button type="button" className={`${b} w-16 text-sm`} disabled={disabled} onClick={j("Z", 1)}>
-          Up
-        </button>
-        <button type="button" className={`${b} w-16 text-sm`} disabled={disabled} onClick={j("Z", -1)}>
-          Down
-        </button>
-      </div>
-      <div className="flex flex-col gap-1 text-xs text-slate-300">
-        <span className="text-slate-500">Step</span>
-        {[10, 1, 0.1].map((v) => (
-          <button
-            key={v}
-            type="button"
-            onClick={() => setStep(v)}
-            className={`rounded-md px-2 py-1 ${step === v ? "bg-teal-600 text-white" : "bg-slate-800 hover:bg-slate-700"}`}
-          >
-            {v} mm
-          </button>
-        ))}
-      </div>
-    </div>
   );
 }
