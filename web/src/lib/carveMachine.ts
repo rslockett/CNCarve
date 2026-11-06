@@ -151,6 +151,8 @@ export class CarveMachine {
   private mpos: Pos | null = null;
   /** Settings just before the current speed test: a failed test goes back to these. */
   private beforeTest: SpeedSettings | null = null;
+  /** Machine position right after the last homing — where the home corner really is. */
+  private homeMpos: Pos | null = null;
   /** Pause plumbing: requested flag, next line to send, and the waiter Resume releases. */
   private pauseRequested = false;
   private nextLine = 0;
@@ -193,6 +195,7 @@ export class CarveMachine {
       };
       await this.serial.connect();
       this.offLines = this.serial.addLineListener((ln) => this.onLine(ln));
+      this.homeMpos = null; // must home again on this connection
       this.set({
         connected: true,
         busy: null,
@@ -334,6 +337,7 @@ export class CarveMachine {
     try {
       await this.unlockIfAlarm();
       await this.serial.sendCommand("$H", HOMING_TIMEOUT_MS);
+      await this.rememberHome();
       // Homing moves the machine, so any zero set before it no longer means the same spot.
       this.set({ homed: true, busy: null, xyZeroSet: false, zZeroSet: false, traced: false });
       this.say("good", "Homed.");
@@ -468,6 +472,7 @@ export class CarveMachine {
     try {
       await this.unlockIfAlarm();
       await this.serial.sendCommand("$H", HOMING_TIMEOUT_MS);
+      await this.rememberHome();
       this.set({ homed: true });
 
       let restored = false;
@@ -663,6 +668,14 @@ export class CarveMachine {
     }
   }
 
+  /** Note where the machine is right after homing (fresh status report). */
+  private async rememberHome() {
+    this.homeMpos = null;
+    await this.serial.sendRealtime("?").catch(() => {});
+    await new Promise((r) => setTimeout(r, 400));
+    this.homeMpos = this.mpos ? { ...this.mpos } : null;
+  }
+
   /** Wait until GRBL reports Idle (its queue is empty and the machine has stopped moving). */
   private async waitForIdle(timeoutMs: number) {
     const until = Date.now() + timeoutMs;
@@ -713,7 +726,8 @@ export class CarveMachine {
     const travel = { x: g[130] > 0 ? g[130] : 290, y: g[131] > 0 ? g[131] : 170, z: g[132] > 0 ? g[132] : 40 };
     let lines: string[];
     try {
-      lines = testPattern(mark, travel);
+      if (!this.homeMpos) throw new Error("Home the machine first, then try again.");
+      lines = testPattern(mark, this.homeMpos, travel);
     } catch (e) {
       this.say("warn", short(e));
       return;

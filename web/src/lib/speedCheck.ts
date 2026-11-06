@@ -65,18 +65,32 @@ export function originalCommands(o: SpeedSettings): string[] {
 }
 
 /**
- * The test pattern in machine coordinates. `travel` comes from $130–$132; GRBL homes to the top
- * corner so machine positions run from 0 down to −travel. Everything stays 3 mm inside that,
- * and never lower than 2 mm above the remembered spot.
+ * The test pattern in machine coordinates.
+ *
+ * GRBL boards don't all number positions the same way after homing: some count down from 0 at the
+ * home corner (−290 … 0), others count up (0 … 290). So nothing here assumes a sign. `home` is
+ * where the machine actually was right after homing; the dot is somewhere the user moved to, so
+ * for each axis the machine's travel runs from `home` in the direction of the dot, for $130–$132
+ * millimetres. Everything stays 3 mm inside that, and the bit only ever lifts toward home in Z,
+ * never higher than 1 mm short of where homing left it.
  */
-export function testPattern(mark: Pos, travel: { x: number; y: number; z: number }): string[] {
-  const xMin = -travel.x + 3,
-    xMax = -3,
-    yMin = -travel.y + 3,
-    yMax = -3;
-  const zLow = mark.z + 2;
-  const zHigh = Math.min(mark.z + 10, -1);
-  if (zHigh <= zLow) throw new Error("There isn't room to lift the bit. Move it lower, then try again.");
+export function testPattern(mark: Pos, home: Pos, travel: { x: number; y: number; z: number }): string[] {
+  const span = (axis: "x" | "y") => {
+    const d = mark[axis] - home[axis];
+    if (Math.abs(d) < 20)
+      throw new Error("Move the bit at least 2 cm away from the home corner (toward the middle of the bed), then try again.");
+    const dir = Math.sign(d);
+    const near = home[axis] + dir * 3;
+    const far = home[axis] + dir * (travel[axis] - 3);
+    return [Math.min(near, far), Math.max(near, far)] as const;
+  };
+  const [xMin, xMax] = span("x");
+  const [yMin, yMax] = span("y");
+  const room = Math.abs(home.z - mark.z); // how far the bit is below where homing left it
+  if (room < 4) throw new Error("There isn't room to lift the bit. Move it lower, then try again.");
+  const up = Math.sign(home.z - mark.z); // direction toward home (up)
+  const zLow = mark.z + up * 2;
+  const zHigh = mark.z + up * Math.min(10, room - 1);
   const cx = (v: number) => Math.min(xMax, Math.max(xMin, v));
   const cy = (v: number) => Math.min(yMax, Math.max(yMin, v));
   const f = (v: number) => v.toFixed(3);
