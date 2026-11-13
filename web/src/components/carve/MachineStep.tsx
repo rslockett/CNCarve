@@ -279,7 +279,7 @@ export function MachineStep({ machine, job, testSettings }: Props) {
               {settingsProblems.map((it) => (
                 <p key={it.id} className={it.status === "problem" ? "text-rose-300" : "text-amber-200"}>
                   {it.status === "problem" ? "✕" : "!"} {it.title}. {it.detail}{" "}
-                  {it.fix && (it.fix === "$32=0" || it.fix === "$13=0") && (
+                  {it.fix && (it.fix === "$32=0" || it.fix === "$13=0" || it.id === "zslip") && (
                     <button
                       type="button"
                       className="ml-1 rounded border border-teal-500/50 px-1.5 text-teal-200"

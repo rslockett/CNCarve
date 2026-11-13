@@ -56,8 +56,26 @@ export function forgetOriginal() {
   }
 }
 
+/**
+ * Only left-right and front-back (X, Y) are sped up. The up-and-down motor (Z) and the corner
+ * setting ($11) keep the machine's own values: raising them made the Z motor slip now and then on
+ * long carvings, and every slip left a line across the whole carving.
+ */
 export function settingCommands(t: SpeedTarget): string[] {
-  return [`$120=${t.accel}`, `$121=${t.accel}`, `$122=${t.accel}`, `$11=${t.junction}`];
+  return [`$120=${t.accel}`, `$121=${t.accel}`];
+}
+
+/**
+ * Earlier speed checks also raised Z acceleration ($122) and the corner setting ($11). When the
+ * original values are known and the machine is above them, the commands that put them back.
+ */
+export function zFixCommands(g: Record<number, number>): string[] | null {
+  const o = loadOriginal();
+  if (!o) return null;
+  const out: string[] = [];
+  if (Number.isFinite(g[122]) && g[122] > o[122]) out.push(`$122=${o[122]}`);
+  if (Number.isFinite(g[11]) && g[11] > o[11]) out.push(`$11=${o[11]}`);
+  return out.length ? out : null;
 }
 
 export function originalCommands(o: SpeedSettings): string[] {

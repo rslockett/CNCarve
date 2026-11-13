@@ -30,6 +30,7 @@ import {
   rememberOriginal,
   settingCommands,
   SPEED_KEYS,
+  zFixCommands,
   testPattern,
   type SpeedSettings,
   type SpeedTarget,
@@ -325,7 +326,17 @@ export class CarveMachine {
       if (Object.keys(s).length) {
         const motion = motionFromGrbl(s);
         saveMotion(motion); // remembered on this device so estimates are right before connecting
-        this.set({ settings: checkMachineSettings(s), motion, grbl: s });
+        const items = checkMachineSettings(s);
+        const zFix = zFixCommands(s);
+        if (zFix)
+          items.push({
+            id: "zslip",
+            status: "problem",
+            title: "The up-and-down motor is set too fast",
+            detail: `The speed check raised its acceleration to ${s[122]} mm/s² (corner setting ${s[11]}). That makes it slip now and then on long carvings, and each slip leaves a line across the carving. This puts it back to your machine's own setting; left-right and front-back stay fast.`,
+            fix: zFix.join(" "),
+          });
+        this.set({ settings: items, motion, grbl: s });
       }
     } catch {
       /* shown as "not checked"; user can retry */
@@ -335,7 +346,7 @@ export class CarveMachine {
   async applyFix(cmd: string) {
     if (!this.idle()) return;
     try {
-      await this.serial.sendCommand(cmd);
+      for (const c of cmd.split(" ").filter(Boolean)) await this.serial.sendCommand(c);
     } catch (e) {
       this.say("bad", String(e instanceof Error ? e.message : e));
     }

@@ -27,8 +27,8 @@ export function SpeedCheck({ machine, s }: { machine: CarveMachine; s: MachineSt
         <div>
           <p className="font-semibold text-white">Speed check</p>
           <p className="text-xs text-slate-400">
-            Now: acceleration {accelNow ?? "?"} mm/s², corner setting {g?.[11] ?? "?"}. No cutting — the
-            spindle stays off.
+            Now: left-right and front-back acceleration {accelNow ?? "?"} mm/s². The up-and-down motor keeps
+            its own setting. No cutting — the spindle stays off.
           </p>
         </div>
         {sc.phase !== "testing" && (
@@ -69,7 +69,7 @@ export function SpeedCheck({ machine, s }: { machine: CarveMachine; s: MachineSt
             </div>
             <p className="text-xs text-slate-500">
               {(sc.target ?? RECOMMENDED).accel === RECOMMENDED.accel
-                ? `${RECOMMENDED.accel} mm/s² with corner setting ${RECOMMENDED.junction} is a common, conservative setting for 3018 machines and usually makes relief carving about twice as fast.`
+                ? `${RECOMMENDED.accel} mm/s² left-right and front-back is a common, conservative setting for 3018 machines. The up-and-down motor is left at your machine's own setting.`
                 : `${FASTER.accel} mm/s² is the faster setting. If the bit isn't exactly on the dot afterwards, your previous settings go back.`}
             </p>
           </div>
