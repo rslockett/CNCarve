@@ -55,7 +55,20 @@ export type Busy =
   | "carving"
   | "restarting"
   | "stopping"
-  | "speedtest";
+  | "speedtest"
+  | "linetest";
+
+/** The line test: two strips, the left at the current settings, the right gentler. */
+export type LineTestState = {
+  phase: "running" | "done" | "stopped";
+  /** Strip being cut (1 = left, 2 = right). */
+  strip: 1 | 2;
+  pct: number;
+  /** Real minutes each strip took (null until finished). */
+  minutes: [number | null, number | null];
+  fast: SpeedSettings;
+  gentle: SpeedSettings;
+};
 
 /** Where the guided speed check is up to. */
 export type SpeedCheckState = {
@@ -108,6 +121,7 @@ export type MachineState = {
   /** All settings as last read with $$. */
   grbl: Record<number, number> | null;
   speedCheck: SpeedCheckState;
+  lineTest: LineTestState | null;
   notice: Notice | null;
 };
 
@@ -145,6 +159,7 @@ export class CarveMachine {
     motion: null,
     grbl: null,
     speedCheck: { phase: "off", mark: null, target: null },
+    lineTest: null,
     notice: null,
   };
   /** Latest machine position (MPos), for remembering the speed-check spot. */
@@ -800,6 +815,92 @@ export class CarveMachine {
     } catch (e) {
       this.say("bad", `Couldn't restore the original settings (${short(e)}).`);
     }
+  }
+
+  // ---- line test ----
+  /**
+   * Cut the two test strips: the left at the current settings, then the right with `gentle`.
+   * The current settings always go back afterwards, also after STOP or an error.
+   */
+  async runLineTest(left: string, right: string, gentle: SpeedSettings) {
+    if (!this.idle()) return;
+    if (!this.state.homed || !this.state.xyZeroSet || !this.state.zZeroSet) {
+      this.say("warn", "Home the machine and set zero on the scrap first.");
+      return;
+    }
+    const g = this.state.grbl;
+    if (!g) {
+      this.say("warn", "The machine's settings haven't been read yet — wait a moment and try again.");
+      return;
+    }
+    const fast: SpeedSettings = { 120: g[120], 121: g[121], 122: g[122], 11: g[11] };
+    const minutes: [number | null, number | null] = [null, null];
+    const show = (strip: 1 | 2, pct: number, phase: LineTestState["phase"] = "running") =>
+      this.set({ lineTest: { phase, strip, pct, minutes: [...minutes], fast, gentle } });
+    this.abort = false;
+    this.set({ busy: "linetest", notice: null });
+    show(1, 0);
+    await this.lockScreen();
+    let changed = false;
+    try {
+      for (const [k, prog] of [left, right].entries()) {
+        const strip = (k + 1) as 1 | 2;
+        if (strip === 2) {
+          // Settings can only change while the machine is standing still.
+          await this.waitForIdle(120_000);
+          changed = true;
+          for (const cmd of originalCommands(gentle)) await this.serial.sendCommand(cmd);
+        }
+        show(strip, 0);
+        const t0 = Date.now();
+        await this.serial.streamGcode(
+          prog,
+          (i, t) => {
+            if (i % 20 === 0 || i === t) show(strip, Math.round((100 * i) / t));
+          },
+          () => this.abort,
+          { perLineTimeoutMs: 120_000 },
+        );
+        if (this.abort) throw new Error("stopped");
+        await this.waitForIdle(120_000);
+        minutes[k] = (Date.now() - t0) / 60_000;
+      }
+      for (const cmd of originalCommands(fast)) await this.serial.sendCommand(cmd);
+      await this.checkSettings();
+      this.set({ busy: null });
+      show(2, 100, "done");
+    } catch (e) {
+      const stopped = this.abort;
+      // After a STOP the controller restarts; give it a moment (GRBL accepts $ settings in alarm).
+      if (stopped) await new Promise((r) => setTimeout(r, 800));
+      let restored = !changed;
+      if (changed && this.state.connected) {
+        try {
+          for (const cmd of originalCommands(fast)) await this.serial.sendCommand(cmd);
+          await this.checkSettings();
+          restored = true;
+        } catch {
+          /* reported below */
+        }
+      }
+      this.set({ busy: null });
+      show(this.state.lineTest?.strip ?? 1, this.state.lineTest?.pct ?? 0, "stopped");
+      this.say(
+        restored ? "warn" : "bad",
+        `${stopped ? "Line test stopped." : `The line test didn't finish (${short(e)}).`} ${
+          restored
+            ? "Your speed settings are unchanged."
+            : `Your settings may still be the gentle ones — reconnect and set $120=${fast[120]}, $121=${fast[121]}, $122=${fast[122]}, $11=${fast[11]}.`
+        }${stopped ? " Home the machine before doing anything else." : ""}`,
+      );
+    } finally {
+      void this.unlockScreen();
+    }
+  }
+
+  closeLineTest() {
+    if (this.state.busy === "linetest") return;
+    this.set({ lineTest: null });
   }
 
   /** Hide the finished carving's picture. */
