@@ -17,7 +17,9 @@ import type { BitShape } from "@/lib/relief/reliefCam";
 import type { ReliefWorkerMessage, ReliefWorkerRequest, TimedResult } from "@/lib/relief/relief.worker";
 import { deriveReliefSettings } from "@/lib/relief/settings";
 import { PROVER_PRESET } from "@/lib/presets/prover";
-import { parseBinaryStl, scaleVertices } from "@/lib/stl";
+import { takePendingDesign } from "@/lib/viewer/handoff";
+import { parseAnyStl } from "@/lib/viewer/stlFile";
+import { scaleVertices } from "@/lib/stl";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { loadFactor, loadMotion } from "@/lib/carveTime";
 import { PROVER_MOTION } from "@/lib/relief/motionTime";
@@ -208,7 +210,8 @@ export function SimpleCarve() {
       }
     : null;
 
-  const onFile = async (f: File | undefined) => {
+  /** `designedHeightMm`: open at this height instead of the largest that fits. */
+  const onFile = async (f: File | undefined, designedHeightMm?: number) => {
     if (!f) return;
     setFileError(null);
     setLoadingFile(true);
@@ -218,14 +221,15 @@ export function SimpleCarve() {
       const n = buf.byteLength >= 84 ? new DataView(buf).getUint32(80, true) : 0;
       if (head === "solid" && 84 + n * 50 !== buf.byteLength)
         throw new Error("This is a text (ASCII) STL. Please export it as a binary STL.");
-      const raw = parseBinaryStl(buf);
+      const raw = parseAnyStl(buf);
       if (raw.length < 9) throw new Error("The file has no triangles in it.");
       const base = orientForCarving(raw);
       // Turn it 90° on the board if that lets it be carved bigger.
       const turned = rotate90(base);
       const autoTurned = largestScale(turned.size, prefs.board) > largestScale(base.size, prefs.board) * 1.02;
-      setDesign({ name: f.name.replace(/\.stl$/i, ""), base, turned: autoTurned, autoTurned });
-      setHeightMm(null);
+      const keepUpright = designedHeightMm !== undefined;
+      setDesign({ name: f.name.replace(/\.stl$/i, ""), base, turned: keepUpright ? false : autoTurned, autoTurned: keepUpright ? false : autoTurned });
+      setHeightMm(designedHeightMm ?? null);
       setTp({ kind: "idle" });
     } catch (e) {
       setDesign(null);
@@ -234,6 +238,18 @@ export function SimpleCarve() {
       setLoadingFile(false);
     }
   };
+
+  // A file picked in the STL viewer ("Carve this") is waiting: load it like a chosen file.
+  useEffect(() => {
+    let live = true;
+    void takePendingDesign().then((d) => {
+      if (live && d) void onFile(new File([d.stl], `${d.name}.stl`), d.heightMm);
+    });
+    return () => {
+      live = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const setBoard = (patch: Partial<Board>) => setPrefs((p) => ({ ...p, board: { ...p.board, ...patch } }));
 
@@ -250,12 +266,20 @@ export function SimpleCarve() {
             <h1 className="text-2xl font-semibold text-white">CNCarve</h1>
             <p className="text-sm text-slate-400">Carve a relief on the 3018 in five steps.</p>
           </div>
-          <Link
-            href="/advanced"
-            className="shrink-0 rounded-lg border border-white/15 bg-slate-900 px-3 py-2 text-xs font-medium text-slate-200 hover:border-teal-500/60 hover:text-white"
-          >
-            Advanced (Kiri:Moto) →
-          </Link>
+          <div className="flex shrink-0 flex-col items-end gap-2">
+            <Link
+              href="/viewer"
+              className="shrink-0 rounded-lg border border-teal-500/40 bg-slate-900 px-3 py-2 text-xs font-medium text-teal-200 hover:border-teal-400 hover:text-white"
+            >
+              STL viewer →
+            </Link>
+            <Link
+              href="/advanced"
+              className="shrink-0 rounded-lg border border-white/15 bg-slate-900 px-3 py-2 text-xs font-medium text-slate-200 hover:border-teal-500/60 hover:text-white"
+            >
+              Advanced (Kiri:Moto) →
+            </Link>
+          </div>
         </header>
 
         <div className="space-y-4">
@@ -280,6 +304,9 @@ export function SimpleCarve() {
                 onChange={(e) => void onFile(e.target.files?.[0])}
               />
             </label>
+            <p className="mt-2 text-xs text-slate-400">
+              Want to look through several files first? Open the <Link href="/viewer" className="text-teal-300 underline">STL viewer</Link>.
+            </p>
             {fileError && <p className="mt-2 text-sm text-rose-300">{fileError}</p>}
             {design?.base.note && <p className="mt-2 text-xs text-slate-400">{design.base.note}</p>}
           </Card>
