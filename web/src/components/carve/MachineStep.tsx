@@ -273,7 +273,7 @@ export function MachineStep({ machine, job, testSettings }: Props) {
                   onClick={() => setLineTestOpen(true)}
                   className="ml-2 mt-1.5 rounded-lg border border-white/15 px-2.5 py-1 text-xs font-medium text-slate-300"
                 >
-                  Line test — about 8 min
+                  Line test — under 10 min
                 </button>
               )}
               {settingsProblems.map((it) => (
