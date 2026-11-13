@@ -29,7 +29,6 @@ import {
   originalCommands,
   rememberOriginal,
   settingCommands,
-  SPEED_KEYS,
   zFixCommands,
   testPattern,
   type SpeedSettings,
@@ -57,20 +56,7 @@ export type Busy =
   | "carving"
   | "restarting"
   | "stopping"
-  | "speedtest"
-  | "linetest";
-
-/** The line test: two strips, the left at the current settings, the right gentler. */
-export type LineTestState = {
-  phase: "running" | "done" | "stopped";
-  /** Strip being cut (1 = left, 2 = right). */
-  strip: 1 | 2;
-  pct: number;
-  /** Real minutes each strip took (null until finished). */
-  minutes: [number | null, number | null];
-  fast: SpeedSettings;
-  gentle: SpeedSettings;
-};
+  | "speedtest";
 
 /** Where the guided speed check is up to. */
 export type SpeedCheckState = {
@@ -123,7 +109,6 @@ export type MachineState = {
   /** All settings as last read with $$. */
   grbl: Record<number, number> | null;
   speedCheck: SpeedCheckState;
-  lineTest: LineTestState | null;
   notice: Notice | null;
 };
 
@@ -161,7 +146,6 @@ export class CarveMachine {
     motion: null,
     grbl: null,
     speedCheck: { phase: "off", mark: null, target: null },
-    lineTest: null,
     notice: null,
   };
   /** Latest machine position (MPos), for remembering the speed-check spot. */
@@ -827,105 +811,6 @@ export class CarveMachine {
     } catch (e) {
       this.say("bad", `Couldn't restore the original settings (${short(e)}).`);
     }
-  }
-
-  // ---- line test ----
-  /**
-   * Cut the line test's parts in order, each with its own speed settings (changed only while the
-   * machine stands still). The settings from before the test always go back afterwards, also
-   * after STOP or an error.
-   */
-  async runLineTest(parts: { strip: 1 | 2; gcode: string; speed: SpeedSettings }[], gentle: SpeedSettings) {
-    if (!this.idle()) return;
-    if (!this.state.homed || !this.state.xyZeroSet || !this.state.zZeroSet) {
-      this.say("warn", "Home the machine and set zero on the scrap first.");
-      return;
-    }
-    const g = this.state.grbl;
-    if (!g) {
-      this.say("warn", "The machine's settings haven't been read yet — wait a moment and try again.");
-      return;
-    }
-    const fast: SpeedSettings = { 120: g[120], 121: g[121], 122: g[122], 11: g[11] };
-    const same = (x: SpeedSettings, y: SpeedSettings) => SPEED_KEYS.every((k) => x[k] === y[k]);
-    const minutes: [number | null, number | null] = [null, null];
-    const show = (strip: 1 | 2, pct: number, phase: LineTestState["phase"] = "running") =>
-      this.set({ lineTest: { phase, strip, pct, minutes: [...minutes], fast, gentle } });
-    this.abort = false;
-    this.set({ busy: "linetest", notice: null });
-    show(1, 0);
-    await this.lockScreen();
-    let applied = fast;
-    const total = parts.reduce((n, p) => n + parseGrblGcodeLines(p.gcode).length, 0);
-    let sentBefore = 0;
-    const stripStart: Partial<Record<1 | 2, number>> = {};
-    try {
-      for (const part of parts) {
-        if (!same(part.speed, applied)) {
-          // Settings can only change while the machine is standing still.
-          await this.waitForIdle(120_000);
-          applied = part.speed; // set first: if a write fails half way, the fast ones still go back
-          for (const cmd of originalCommands(part.speed)) await this.serial.sendCommand(cmd);
-        }
-        if (stripStart[part.strip] === undefined) {
-          stripStart[part.strip] = Date.now();
-          if (part.strip === 2 && stripStart[1] !== undefined) {
-            await this.waitForIdle(120_000);
-            minutes[0] = (Date.now() - stripStart[1]) / 60_000;
-            stripStart[2] = Date.now();
-          }
-        }
-        await this.serial.streamGcode(
-          part.gcode,
-          (i, t) => {
-            if (i % 20 === 0 || i === t) show(part.strip, Math.round((100 * (sentBefore + i)) / total));
-          },
-          () => this.abort,
-          { perLineTimeoutMs: 120_000 },
-        );
-        if (this.abort) throw new Error("stopped");
-        sentBefore += parseGrblGcodeLines(part.gcode).length;
-      }
-      await this.waitForIdle(120_000);
-      const last = parts[parts.length - 1].strip;
-      if (stripStart[last] !== undefined) minutes[last - 1] = (Date.now() - stripStart[last]!) / 60_000;
-      if (!same(applied, fast)) for (const cmd of originalCommands(fast)) await this.serial.sendCommand(cmd);
-      applied = fast;
-      await this.checkSettings();
-      this.set({ busy: null });
-      show(2, 100, "done");
-    } catch (e) {
-      const stopped = this.abort;
-      // After a STOP the controller restarts; give it a moment (GRBL accepts $ settings in alarm).
-      if (stopped) await new Promise((r) => setTimeout(r, 800));
-      let restored = same(applied, fast);
-      if (!restored && this.state.connected) {
-        try {
-          for (const cmd of originalCommands(fast)) await this.serial.sendCommand(cmd);
-          await this.checkSettings();
-          restored = true;
-        } catch {
-          /* reported below */
-        }
-      }
-      this.set({ busy: null });
-      show(this.state.lineTest?.strip ?? 1, this.state.lineTest?.pct ?? 0, "stopped");
-      this.say(
-        restored ? "warn" : "bad",
-        `${stopped ? "Line test stopped." : `The line test didn't finish (${short(e)}).`} ${
-          restored
-            ? "Your speed settings are unchanged."
-            : `Your settings may still be the gentle ones — reconnect and set $120=${fast[120]}, $121=${fast[121]}, $122=${fast[122]}, $11=${fast[11]}.`
-        }${stopped ? " Home the machine before doing anything else." : ""}`,
-      );
-    } finally {
-      void this.unlockScreen();
-    }
-  }
-
-  closeLineTest() {
-    if (this.state.busy === "linetest") return;
-    this.set({ lineTest: null });
   }
 
   /** Hide the finished carving's picture. */
