@@ -29,6 +29,7 @@ import {
   originalCommands,
   rememberOriginal,
   settingCommands,
+  SPEED_KEYS,
   testPattern,
   type SpeedSettings,
   type SpeedTarget,
@@ -819,10 +820,11 @@ export class CarveMachine {
 
   // ---- line test ----
   /**
-   * Cut the two test strips: the left at the current settings, then the right with `gentle`.
-   * The current settings always go back afterwards, also after STOP or an error.
+   * Cut the line test's parts in order, each with its own speed settings (changed only while the
+   * machine stands still). The settings from before the test always go back afterwards, also
+   * after STOP or an error.
    */
-  async runLineTest(left: string, right: string, gentle: SpeedSettings) {
+  async runLineTest(parts: { strip: 1 | 2; gcode: string; speed: SpeedSettings }[], gentle: SpeedSettings) {
     if (!this.idle()) return;
     if (!this.state.homed || !this.state.xyZeroSet || !this.state.zZeroSet) {
       this.say("warn", "Home the machine and set zero on the scrap first.");
@@ -834,6 +836,7 @@ export class CarveMachine {
       return;
     }
     const fast: SpeedSettings = { 120: g[120], 121: g[121], 122: g[122], 11: g[11] };
+    const same = (x: SpeedSettings, y: SpeedSettings) => SPEED_KEYS.every((k) => x[k] === y[k]);
     const minutes: [number | null, number | null] = [null, null];
     const show = (strip: 1 | 2, pct: number, phase: LineTestState["phase"] = "running") =>
       this.set({ lineTest: { phase, strip, pct, minutes: [...minutes], fast, gentle } });
@@ -841,31 +844,42 @@ export class CarveMachine {
     this.set({ busy: "linetest", notice: null });
     show(1, 0);
     await this.lockScreen();
-    let changed = false;
+    let applied = fast;
+    const total = parts.reduce((n, p) => n + parseGrblGcodeLines(p.gcode).length, 0);
+    let sentBefore = 0;
+    const stripStart: Partial<Record<1 | 2, number>> = {};
     try {
-      for (const [k, prog] of [left, right].entries()) {
-        const strip = (k + 1) as 1 | 2;
-        if (strip === 2) {
+      for (const part of parts) {
+        if (!same(part.speed, applied)) {
           // Settings can only change while the machine is standing still.
           await this.waitForIdle(120_000);
-          changed = true;
-          for (const cmd of originalCommands(gentle)) await this.serial.sendCommand(cmd);
+          applied = part.speed; // set first: if a write fails half way, the fast ones still go back
+          for (const cmd of originalCommands(part.speed)) await this.serial.sendCommand(cmd);
         }
-        show(strip, 0);
-        const t0 = Date.now();
+        if (stripStart[part.strip] === undefined) {
+          stripStart[part.strip] = Date.now();
+          if (part.strip === 2 && stripStart[1] !== undefined) {
+            await this.waitForIdle(120_000);
+            minutes[0] = (Date.now() - stripStart[1]) / 60_000;
+            stripStart[2] = Date.now();
+          }
+        }
         await this.serial.streamGcode(
-          prog,
+          part.gcode,
           (i, t) => {
-            if (i % 20 === 0 || i === t) show(strip, Math.round((100 * i) / t));
+            if (i % 20 === 0 || i === t) show(part.strip, Math.round((100 * (sentBefore + i)) / total));
           },
           () => this.abort,
           { perLineTimeoutMs: 120_000 },
         );
         if (this.abort) throw new Error("stopped");
-        await this.waitForIdle(120_000);
-        minutes[k] = (Date.now() - t0) / 60_000;
+        sentBefore += parseGrblGcodeLines(part.gcode).length;
       }
-      for (const cmd of originalCommands(fast)) await this.serial.sendCommand(cmd);
+      await this.waitForIdle(120_000);
+      const last = parts[parts.length - 1].strip;
+      if (stripStart[last] !== undefined) minutes[last - 1] = (Date.now() - stripStart[last]!) / 60_000;
+      if (!same(applied, fast)) for (const cmd of originalCommands(fast)) await this.serial.sendCommand(cmd);
+      applied = fast;
       await this.checkSettings();
       this.set({ busy: null });
       show(2, 100, "done");
@@ -873,8 +887,8 @@ export class CarveMachine {
       const stopped = this.abort;
       // After a STOP the controller restarts; give it a moment (GRBL accepts $ settings in alarm).
       if (stopped) await new Promise((r) => setTimeout(r, 800));
-      let restored = !changed;
-      if (changed && this.state.connected) {
+      let restored = same(applied, fast);
+      if (!restored && this.state.connected) {
         try {
           for (const cmd of originalCommands(fast)) await this.serial.sendCommand(cmd);
           await this.checkSettings();

@@ -1,7 +1,7 @@
 "use client";
 
 import type { CarveMachine, MachineState } from "@/lib/carveMachine";
-import { buildLineTest, gentleSettings, motionWith, speedOf } from "@/lib/lineTest";
+import { buildLineTest, gentleSettings, speedOf } from "@/lib/lineTest";
 import { motionFromGrbl } from "@/lib/relief/motionTime";
 import type { ReliefSettings } from "@/lib/relief/settings";
 import { useMemo } from "react";
@@ -30,7 +30,7 @@ export function LineTest({
     const fast = speedOf(g);
     const gentle = gentleSettings(g);
     const m = s.motion ?? motionFromGrbl(g);
-    return { fast, gentle, ...buildLineTest(settings, motionWith(m, fast), motionWith(m, gentle)) };
+    return { fast, gentle, ...buildLineTest(settings, m, fast, gentle) };
   }, [g, s.motion, settings]);
   const lt = s.lineTest;
   const ready = s.homed && s.xyZeroSet && s.zZeroSet;
@@ -46,8 +46,8 @@ export function LineTest({
         <div>
           <p className="font-semibold text-white">Line test</p>
           <p className="text-xs text-slate-400">
-            Two small strips cut exactly like the detail pass — the left at your current settings, the right
-            gentler — to see which one leaves lines.
+            Two small strips cut like a real carving — roughing, then the detail pass. The left is all at your
+            current settings; the right roughs at your original settings. Which one has lines?
           </p>
         </div>
         {!running && (
@@ -69,13 +69,13 @@ export function LineTest({
       ) : running && lt ? (
         <div className="space-y-3">
           <p className="text-slate-200">
-            Cutting the {lt.strip === 1 ? "left strip (your current settings)" : "right strip (gentler)"}…{" "}
+            Cutting the {lt.strip === 1 ? "left strip (all at your current settings)" : "right strip (roughing at your original settings)"}…{" "}
             {lt.pct}%
           </p>
           <div className="h-2 overflow-hidden rounded-full bg-slate-800">
             <div
               className="h-full bg-gradient-to-r from-teal-500 to-emerald-500"
-              style={{ width: `${(lt.strip === 1 ? 0 : 50) + lt.pct / 2}%` }}
+              style={{ width: `${lt.pct}%` }}
             />
           </div>
           <StopButton machine={machine} s={s} big={false} />
@@ -90,11 +90,11 @@ export function LineTest({
           </p>
           <ul className="list-disc space-y-0.5 pl-5 text-xs text-slate-400">
             <li>
-              Left: acceleration {accel(lt.fast)} mm/s², corner {lt.fast[11]}
+              Left: roughing and detail at {accel(lt.fast)} mm/s², corner {lt.fast[11]}
               {lt.minutes[0] !== null && ` — took ${lt.minutes[0].toFixed(1)} min`}
             </li>
             <li>
-              Right: acceleration {accel(lt.gentle)} mm/s², corner {lt.gentle[11]}
+              Right: roughing at {accel(lt.gentle)} mm/s², corner {lt.gentle[11]}; detail at {accel(lt.fast)} mm/s²
               {lt.minutes[1] !== null && ` — took ${lt.minutes[1].toFixed(1)} min`}
             </li>
           </ul>
@@ -110,15 +110,15 @@ export function LineTest({
             <li>Turn on dust collection and press Cut. It takes about {minText(test.minutes[0] + test.minutes[1])}.</li>
           </ol>
           <p className="text-xs text-slate-400">
-            Left strip: acceleration {accel(test.fast)} mm/s², corner {test.fast[11]} (about{" "}
-            {minText(test.minutes[0])}). Right strip: acceleration {accel(test.gentle)} mm/s², corner{" "}
-            {test.gentle[11]} (about {minText(test.minutes[1])}). Cut 0.3 mm deep at most.
+            Left strip: roughing and detail at {accel(test.fast)} mm/s² (about {minText(test.minutes[0])}).
+            Right strip: roughing at {accel(test.gentle)} mm/s², detail at {accel(test.fast)} mm/s² (about{" "}
+            {minText(test.minutes[1])}). Each strip is about ½ × ¼ in and 1.1 mm deep.
           </p>
           <button
             type="button"
             className={primary}
             disabled={!ready || s.busy !== null}
-            onClick={() => void machine.runLineTest(test.left, test.right, test.gentle)}
+            onClick={() => void machine.runLineTest(test.parts, test.gentle)}
           >
             Cut the line test
           </button>
