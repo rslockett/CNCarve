@@ -6,8 +6,6 @@ import type { BitShape, CarveProgram } from "@/lib/relief/reliefCam";
 import { JogPad } from "./JogPad";
 import { LiveCarveView } from "./LiveCarveView";
 import { SpeedCheck } from "./SpeedCheck";
-import { LineTest } from "./LineTest";
-import type { ReliefSettings } from "@/lib/relief/settings";
 import { loadFactor } from "@/lib/carveTime";
 import { useCallback, useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
 
@@ -24,8 +22,6 @@ type Props = {
         timeline: number[];
       })
     | null;
-  /** The user's bit / wood settings, for the line test. */
-  testSettings: ReliefSettings | null;
 };
 
 const DEFAULT_BIT: BitShape = { type: "vee", halfAngleDeg: 10, tipDiameterMm: 0.1, diameterMm: 3.175 };
@@ -68,7 +64,7 @@ function minutesDone(job: { sections: { start: number }[]; sectionMinutes: numbe
   return done;
 }
 
-export function MachineStep({ machine, job, testSettings }: Props) {
+export function MachineStep({ machine, job }: Props) {
   const s: MachineState = useSyncExternalStore(machine.subscribe, machine.getState, machine.getState);
   // USB support can only be known in the browser; the server render assumes it's there.
   const supported = useSyncExternalStore(noopSubscribe, () => machine.isSupported(), () => true);
@@ -77,7 +73,6 @@ export function MachineStep({ machine, job, testSettings }: Props) {
   const [saved, setSaved] = useState<SavedCarve | null>(null);
   const [jogStep, setJogStep] = useState(1);
   const [probeMode, setProbeMode] = useState(false);
-  const [lineTestOpen, setLineTestOpen] = useState(false);
   const [plateMm, setPlateMm] = useState(() => {
     try {
       return Number(localStorage.getItem("cncarve:plateMm")) || 0;
@@ -241,9 +236,6 @@ export function MachineStep({ machine, job, testSettings }: Props) {
       {s.notice && <p className={`rounded-xl border p-3 text-sm ${TONE[s.notice.tone]}`}>{s.notice.text}</p>}
 
       {s.connected && s.speedCheck.phase !== "off" && <SpeedCheck machine={machine} s={s} />}
-      {s.connected && testSettings && (lineTestOpen || s.lineTest) && (
-        <LineTest machine={machine} s={s} settings={testSettings} onClose={() => setLineTestOpen(false)} />
-      )}
 
       <ol className="space-y-4">
         <Row n={1} done={s.connected} title="Connect to the 3018 with the USB cable">
@@ -267,19 +259,10 @@ export function MachineStep({ machine, job, testSettings }: Props) {
                   Speed check — carve faster safely
                 </button>
               )}
-              {s.grbl && testSettings && !lineTestOpen && !s.lineTest && s.busy === null && (
-                <button
-                  type="button"
-                  onClick={() => setLineTestOpen(true)}
-                  className="ml-2 mt-1.5 rounded-lg border border-white/15 px-2.5 py-1 text-xs font-medium text-slate-300"
-                >
-                  Line test — under 10 min
-                </button>
-              )}
               {settingsProblems.map((it) => (
                 <p key={it.id} className={it.status === "problem" ? "text-rose-300" : "text-amber-200"}>
                   {it.status === "problem" ? "✕" : "!"} {it.title}. {it.detail}{" "}
-                  {it.fix && (it.fix === "$32=0" || it.fix === "$13=0") && (
+                  {it.fix && (it.fix === "$32=0" || it.fix === "$13=0" || it.id === "zslip") && (
                     <button
                       type="button"
                       className="ml-1 rounded border border-teal-500/50 px-1.5 text-teal-200"

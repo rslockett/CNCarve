@@ -23,7 +23,6 @@ import { loadFactor, loadMotion } from "@/lib/carveTime";
 import { PROVER_MOTION } from "@/lib/relief/motionTime";
 import { MachineBar } from "./MachineBar";
 import { MachineStep } from "./MachineStep";
-import { STRIP_H, STRIP_W } from "@/lib/lineTest";
 import { ReliefPreview } from "./ReliefPreview";
 
 type Units = "in" | "mm";
@@ -131,16 +130,6 @@ export function SimpleCarve() {
         : null,
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [sized?.x, sized?.y, prefs.toolId, prefs.wood],
-  );
-
-  // Same bit and wood as a real carving, for the line test's strips.
-  const testSettings = useMemo(
-    () =>
-      deriveReliefSettings(
-        { machineId: PROVER_PRESET.id, toolId: prefs.toolId, materialId: prefs.wood, qualityId: "balanced" },
-        { x: STRIP_W, y: STRIP_H },
-      ),
-    [prefs.toolId, prefs.wood],
   );
 
   const key = design && sized && settings
@@ -441,7 +430,7 @@ export function SimpleCarve() {
           </Card>
 
           <Card n={5} title="Carve" done={false} open>
-            <MachineStep machine={machine} job={step4 ? job : null} testSettings={testSettings} />
+            <MachineStep machine={machine} job={step4 ? job : null} />
           </Card>
         </div>
       </div>
