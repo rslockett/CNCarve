@@ -29,7 +29,7 @@ import {
   originalCommands,
   rememberOriginal,
   settingCommands,
-  zFixCommands,
+  FAST_SETTINGS,
   testPattern,
   type SpeedSettings,
   type SpeedTarget,
@@ -310,17 +310,7 @@ export class CarveMachine {
       if (Object.keys(s).length) {
         const motion = motionFromGrbl(s);
         saveMotion(motion); // remembered on this device so estimates are right before connecting
-        const items = checkMachineSettings(s);
-        const zFix = zFixCommands(s);
-        if (zFix)
-          items.push({
-            id: "zslip",
-            status: "problem",
-            title: "The up-and-down motor is set too fast",
-            detail: `The speed check raised its acceleration to ${s[122]} mm/s² (corner setting ${s[11]}). That makes it slip now and then on long carvings, and each slip leaves a line across the carving. This puts it back to your machine's own setting; left-right and front-back stay fast.`,
-            fix: zFix.join(" "),
-          });
-        this.set({ settings: items, motion, grbl: s });
+        this.set({ settings: checkMachineSettings(s), motion, grbl: s });
       }
     } catch {
       /* shown as "not checked"; user can retry */
@@ -810,6 +800,28 @@ export class CarveMachine {
       if (!quiet) this.say("good", "Your original speed settings are back.");
     } catch (e) {
       this.say("bad", `Couldn't restore the original settings (${short(e)}).`);
+    }
+  }
+
+  /** Switch to one of the two known setups (see FAST_SETTINGS). */
+  async useSpeed(profile: "fast" | "original") {
+    if (!this.idle()) return;
+    const target = profile === "fast" ? FAST_SETTINGS : loadOriginal();
+    if (!target) {
+      this.say("warn", "This device doesn't remember your original settings.");
+      return;
+    }
+    try {
+      for (const cmd of originalCommands(target)) await this.serial.sendCommand(cmd);
+      await this.checkSettings();
+      this.say(
+        "good",
+        profile === "fast"
+          ? "Fast settings on: 30 mm/s² on all motors. Carving times have been updated."
+          : "Original settings on (slow). Carving times have been updated.",
+      );
+    } catch (e) {
+      this.say("bad", `Couldn't change the settings (${short(e)}).`);
     }
   }
 

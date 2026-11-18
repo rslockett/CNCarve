@@ -111,7 +111,7 @@ export function checkMachineSettings(s: GrblSettings): MachineCheckItem[] {
             status: "warn",
             title: `Acceleration is low (${a} mm/s²)`,
             detail:
-              "Relief carvings are thousands of tiny moves, so the machine spends most of its time speeding up and slowing down. Run the speed check to try a faster setting safely.",
+              "Relief carvings are thousands of tiny moves, so the machine spends most of its time speeding up and slowing down. Tap Fast below to carve about twice as fast.",
           }
         : { id: "accel", status: "ok", title: `Acceleration is ${a} mm/s²`, detail: "Good for relief carving." },
     );

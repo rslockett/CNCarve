@@ -438,6 +438,44 @@ export function generateCarve(input: ReliefInput): ReliefResult {
     for (let k = 0; k < n; k++) if (work[k] && Zl[k] < cur[k]) cur[k] = Zl[k];
   });
 
+  // Fin clean-up (V-bits). Every roughing layer cuts its grooves on the same rows, so a thin fin
+  // of wood is left standing between each pair of grooves, up to ~1.3 mm above the finished
+  // surface instead of the planned skin. The detail pass then has to shave each fin away from one
+  // side; in hardwood the last sliver bends or tears instead of cutting, and the bit takes bites
+  // several times bigger than planned. That leaves lines along the rows. One more row at the
+  // roughing depth, centred between each pair of roughing rows, splits every fin evenly from both
+  // sides (no thin sliver is ever left leaning) and halves what the detail pass has to remove.
+  if (bit.type === "vee" && roughPx >= 3) {
+    const t = Math.tan((bit.halfAngleDeg * Math.PI) / 180);
+    const offs = [Math.round(roughPx / 2)];
+    const cleanRows: { j: number; below: number; above: number }[] = [];
+    for (const j0 of roughRows)
+      offs.forEach((o, idx) => {
+        const j = j0 + o;
+        // Nearest rows already cut when this one runs: the clean-up row before it (or the
+        // roughing row) below, and the next roughing row above.
+        if (j <= wj1) cleanRows.push({ j, below: idx === 0 ? o : o - offs[idx - 1], above: roughPx - o });
+      });
+    // Where the wood really is on each clean-up row: the top of the fin, set by the bit's cone on
+    // the rows either side (never above the board). -1e9 = nothing to cut there.
+    const coneAt = (j: number, i: number, dPx: number) => {
+      if (j < 0 || j >= H) return 0;
+      const k = j * W + i;
+      return work[k] ? cur[k] + Math.max(0, dPx * R - bit.tipDiameterMm / 2) / t : 0;
+    };
+    const woodTop = new Float32Array(n).fill(-1e9);
+    for (const { j, below, above } of cleanRows)
+      for (let i = 0; i < W; i++) {
+        const k = j * W + i;
+        if (!work[k]) continue;
+        const top = Math.min(0, coneAt(j - below, i, below), coneAt(j + above, i, above));
+        if (top > Zr[k] + 0.02) woodTop[k] = top;
+      }
+    progress(0.6, "Planning the fin clean-up");
+    w.section("Roughing - fin clean-up");
+    raster(Zr, cleanRows.map((r) => r.j), P.feedRough, woodTop);
+  }
+
   // Detail pass, in three parts so progress reads naturally.
   progress(0.62, "Planning the detail pass");
   const finishPx = Math.max(1, Math.round(P.finishStepMm / R));
