@@ -8,7 +8,7 @@
 
 import type { JsonObject, WizardAnswers } from "../presets/types";
 import { getMachineOrDefault, listMaterials } from "../wizard";
-import type { BitShape, ReliefCamParams } from "./reliefCam";
+import type { BitShape, FinishMode, ReliefCamParams } from "./reliefCam";
 
 const MM_PER_IN = 25.4;
 
@@ -71,6 +71,7 @@ export type ReliefSettings = {
 export function deriveReliefSettings(
   choices: CarveChoices,
   designSizeMm: { x: number; y: number },
+  finish: FinishMode = "asBefore",
 ): ReliefSettings {
   const preset = getMachineOrDefault(choices.machineId);
   const toolRow = preset.tools.find((t) => (t.id as number) === choices.toolId);
@@ -95,7 +96,11 @@ export function deriveReliefSettings(
 
   // Two grid pixels per detail pass, but keep big carvings under ~3 million pixels.
   const area = Math.max(1, designSizeMm.x * designSizeMm.y);
-  const resMm = Math.min(0.3, Math.max(0.025, finishStepMm / 2, Math.sqrt(area / 3_000_000)));
+  let resMm = Math.min(0.3, Math.max(0.025, finishStepMm / 2, Math.sqrt(area / 3_000_000)));
+  // New finishes: a grid that fits a whole number of pixels into the detail step, so the detail
+  // rows land exactly that far apart (never wider, which leaves ridges; never closer than needed,
+  // which costs time). "asBefore" keeps the old grid exactly.
+  if (finish !== "asBefore" && resMm <= finishStepMm) resMm = finishStepMm / Math.max(1, Math.floor(finishStepMm / resMm + 1e-6));
 
   return {
     bit,
@@ -118,6 +123,7 @@ export function deriveReliefSettings(
       safeZ: 3,
       clearZ: 1,
       resMm,
+      finish,
     },
   };
 }

@@ -56,26 +56,25 @@ export function forgetOriginal() {
   }
 }
 
-/**
- * Only left-right and front-back (X, Y) are sped up. The up-and-down motor (Z) and the corner
- * setting ($11) keep the machine's own values: raising them made the Z motor slip now and then on
- * long carvings, and every slip left a line across the whole carving.
- */
 export function settingCommands(t: SpeedTarget): string[] {
-  return [`$120=${t.accel}`, `$121=${t.accel}`];
+  return [`$120=${t.accel}`, `$121=${t.accel}`, `$122=${t.accel}`, `$11=${t.junction}`];
 }
 
 /**
- * Earlier speed checks also raised Z acceleration ($122) and the corner setting ($11). When the
- * original values are known and the machine is above them, the commands that put them back.
+ * The two known setups, so either can be put back with one tap:
+ *  - Fast: what the speed check set (30 mm/s² on all motors, corner 0.02), used for carvings
+ *    from the speed check until the up-and-down change.
+ *  - Original: the machine's own settings from before the first speed check (slow, the clean cross).
  */
-export function zFixCommands(g: Record<number, number>): string[] | null {
+export const FAST_SETTINGS: SpeedSettings = { 120: 30, 121: 30, 122: 30, 11: 0.02 };
+
+export type SpeedProfile = "fast" | "original" | "other";
+
+export function speedProfileOf(g: Record<number, number>): SpeedProfile {
+  const same = (o: SpeedSettings) => SPEED_KEYS.every((k) => Math.abs(g[k] - o[k]) < 1e-6);
+  if (same(FAST_SETTINGS)) return "fast";
   const o = loadOriginal();
-  if (!o) return null;
-  const out: string[] = [];
-  if (Number.isFinite(g[122]) && g[122] > o[122]) out.push(`$122=${o[122]}`);
-  if (Number.isFinite(g[11]) && g[11] > o[11]) out.push(`$11=${o[11]}`);
-  return out.length ? out : null;
+  return o && same(o) ? "original" : "other";
 }
 
 export function originalCommands(o: SpeedSettings): string[] {
@@ -141,4 +140,12 @@ export function testPattern(mark: Pos, home: Pos, travel: { x: number; y: number
   L.push(`G53 G0 X${f(mark.x)} Y${f(mark.y)}`);
   L.push(`G53 G1 Z${f(mark.z)} F200`);
   return L;
+}
+
+/** Motion settings for time estimates with these speed settings (max rates kept from `base`). */
+export function motionWithSpeed<T extends { accel: [number, number, number]; junctionDeviation: number }>(
+  base: T,
+  s: SpeedSettings,
+): T {
+  return { ...base, accel: [s[120], s[121], s[122]], junctionDeviation: s[11] };
 }

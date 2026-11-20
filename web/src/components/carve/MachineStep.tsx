@@ -7,6 +7,7 @@ import { JogPad } from "./JogPad";
 import { LiveCarveView } from "./LiveCarveView";
 import { SpeedCheck } from "./SpeedCheck";
 import { loadFactor } from "@/lib/carveTime";
+import type { SpeedSettings } from "@/lib/speedCheck";
 import { useCallback, useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
 
 type Props = {
@@ -20,6 +21,7 @@ type Props = {
         bit: BitShape;
         area: { minX: number; maxX: number; minY: number; maxY: number };
         timeline: number[];
+        speed?: SpeedSettings | null;
       })
     | null;
 };
@@ -250,19 +252,10 @@ export function MachineStep({ machine, job }: Props) {
                 : settingsProblems.length === 0
                   ? "Machine settings look right."
                   : null}
-              {s.grbl && s.speedCheck.phase === "off" && s.busy === null && (
-                <button
-                  type="button"
-                  onClick={() => machine.openSpeedCheck()}
-                  className={`mt-1.5 rounded-lg px-2.5 py-1 text-xs font-medium ${settingsProblems.some((i) => i.id === "accel") ? "bg-teal-600 text-white" : "border border-white/15 text-slate-300"}`}
-                >
-                  Speed check — carve faster safely
-                </button>
-              )}
               {settingsProblems.map((it) => (
                 <p key={it.id} className={it.status === "problem" ? "text-rose-300" : "text-amber-200"}>
                   {it.status === "problem" ? "✕" : "!"} {it.title}. {it.detail}{" "}
-                  {it.fix && (it.fix === "$32=0" || it.fix === "$13=0" || it.id === "zslip") && (
+                  {it.fix && (it.fix === "$32=0" || it.fix === "$13=0") && (
                     <button
                       type="button"
                       className="ml-1 rounded border border-teal-500/50 px-1.5 text-teal-200"
@@ -401,6 +394,7 @@ export function MachineStep({ machine, job }: Props) {
                         bit: job.bit,
                         area: job.area,
                         timeline: job.timeline,
+                        speed: job.speed ?? undefined,
                       })
                     }
                   >
@@ -486,3 +480,4 @@ function Row({ n, done, title, children }: { n: number; done: boolean; title: st
     </li>
   );
 }
+
