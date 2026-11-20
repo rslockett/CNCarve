@@ -46,6 +46,17 @@ crosses, plaques) on a 3018-PROVer.
   `web/scripts/check-carve.ts` proves a design's program is safe: roughing and detail cuts
   match the original program, and every fast move checked against a 3D simulation of the wood.
 
+## STL viewer
+
+**`/viewer`** (the **STL viewer →** button on the home page) opens one or many STL files and
+shows each one shaded like carved wood: zoom and pan, move the light to bring out detail, and see
+its size. A **Size** panel sets height, width and depth (inches), with or without keeping
+proportions; **Carve this →** opens it in Simple carve at that size, and **Save STL** downloads
+the resized file. Files stay on the computer.
+
+Both the viewer and Simple carve read binary STLs and text ("ASCII") STLs, such as some ArtCAM
+exports. Binary files load exactly as before.
+
 The original Kiri:Moto workspace is at **`/advanced`**. Engine code: `web/src/lib/relief/`;
 machine control: `web/src/lib/carveMachine.ts`, `web/src/lib/carveStore.ts`; screen:
 `web/src/components/carve/`. `web/scripts/relief-cli.ts` runs the engine from the command line.
