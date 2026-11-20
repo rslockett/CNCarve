@@ -141,3 +141,11 @@ export function testPattern(mark: Pos, home: Pos, travel: { x: number; y: number
   L.push(`G53 G1 Z${f(mark.z)} F200`);
   return L;
 }
+
+/** Motion settings for time estimates with these speed settings (max rates kept from `base`). */
+export function motionWithSpeed<T extends { accel: [number, number, number]; junctionDeviation: number }>(
+  base: T,
+  s: SpeedSettings,
+): T {
+  return { ...base, accel: [s[120], s[121], s[122]], junctionDeviation: s[11] };
+}

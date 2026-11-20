@@ -7,23 +7,30 @@ import { generateCarve, type ReliefInput, type ReliefResult } from "./reliefCam"
 export type ReliefWorkerRequest = Omit<ReliefInput, "onProgress"> & {
   /** The machine's speed / acceleration settings, for the time estimate. */
   motion: MotionSettings;
+  /** Other speed settings to estimate the time for too (e.g. Fast and Original). */
+  extraMotions?: MotionSettings[];
+  /** Only work out the times (for comparing finish options); no program is sent back. */
+  estimateOnly?: boolean;
 };
 
 /** The engine's result, with times worked out from GRBL's motion rules. */
 export type TimedResult = ReliefResult & {
   program: ReliefResult["program"] & { timeline: number[] };
+  /** Minutes with each of `extraMotions`, same order. */
+  extraMinutes: number[];
 };
 
 export type ReliefWorkerMessage =
   | { type: "progress"; fraction: number; label: string }
   | { type: "done"; result: TimedResult }
+  | { type: "estimate"; minutes: number[] }
   | { type: "error"; message: string };
 
 self.onmessage = (ev: MessageEvent<ReliefWorkerRequest>) => {
   const post = (m: ReliefWorkerMessage, transfer: Transferable[] = []) =>
     (self as unknown as DedicatedWorkerGlobalScope).postMessage(m, transfer);
   try {
-    const { motion, ...input } = ev.data;
+    const { motion, extraMotions = [], estimateOnly = false, ...input } = ev.data;
     const result = generateCarve({
       ...input,
       onProgress: (fraction, label) => post({ type: "progress", fraction: fraction * 0.92, label }),
@@ -32,6 +39,12 @@ self.onmessage = (ev: MessageEvent<ReliefWorkerRequest>) => {
     // The G-code itself is untouched; only the estimate changes.
     post({ type: "progress", fraction: 0.95, label: "Working out the carving time" });
     const p = result.program;
+    const total = (m: MotionSettings) => lineSeconds(p.gcode, m).reduce((a, b) => a + b, 0) / 60;
+    const extraMinutes = extraMotions.map(total);
+    if (estimateOnly) {
+      post({ type: "estimate", minutes: [total(motion), ...extraMinutes] });
+      return;
+    }
     const sec = lineSeconds(p.gcode, motion);
     const timeline = buildTimeline(sec);
     const sectionMinutes = p.sections.map((s, i) => {
@@ -51,9 +64,10 @@ self.onmessage = (ev: MessageEvent<ReliefWorkerRequest>) => {
         sectionMinutes,
         timeline,
       },
+      extraMinutes,
     };
     const pv = timed.preview;
-    post({ type: "done", result: timed }, [pv.target.buffer, pv.carved.buffer, pv.work.buffer]);
+    post({ type: "done", result: timed }, [pv.target.buffer, pv.carved.buffer, pv.work.buffer, pv.beforeDetail.buffer]);
   } catch (e) {
     post({ type: "error", message: e instanceof Error ? e.message : String(e) });
   }

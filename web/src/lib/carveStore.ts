@@ -26,6 +26,8 @@ export type SavedCarve = {
   area?: { minX: number; maxX: number; minY: number; maxY: number };
   /** Predicted cumulative seconds every 100 lines (see carveTime.ts), for live "time left". */
   timeline?: number[];
+  /** Speed settings ($120-$122, $11) this carve runs with; put on the machine before it starts or continues. */
+  speed?: Record<120 | 121 | 122 | 11, number>;
 };
 
 export type CarveProgress = {

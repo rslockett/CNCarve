@@ -44,7 +44,40 @@ export type ReliefCamParams = {
   clearZ: number;
   /** Grid resolution (mm per pixel). */
   resMm: number;
+  /** How the wood between roughing rows is handled before the detail pass (default "asBefore"). */
+  finish?: FinishMode;
 };
+
+/**
+ * - asBefore: exactly the program this engine made before the fin clean-up (no clean-up, the bit
+ *   lifts above the board between cuts). Kept so carvings can always go back to it.
+ * - quick: no clean-up (fins stay for the detail pass), with the short, checked moves.
+ * - standard: two clean-up rows between each pair of roughing rows (fins about 0.35 mm), and
+ *   short, checked moves between cuts.
+ * - smoothest: clean-up rows all the way across at the detail spacing, leaving an even skin.
+ */
+export type FinishMode = "asBefore" | "quick" | "standard" | "smoothest";
+
+/**
+ * Detail rows are this many grid pixels apart. "asBefore" rounds (so some sizes ended up with
+ * rows ~0.13 mm apart, leaving small ridges with a 0.1 mm tip); the new modes are never wider
+ * apart than the detail step.
+ */
+export function finishRowPx(finish: FinishMode, finishStepMm: number, res: number): number {
+  const r = finishStepMm / res;
+  return Math.max(1, finish === "asBefore" ? Math.round(r) : Math.floor(r + 1e-6));
+}
+
+/** Clean-up rows between two roughing rows, in grid pixels from the lower one (ascending). */
+export function cleanupOffsets(finish: FinishMode, roughPx: number, finishPx: number): number[] {
+  const offs: number[] = [];
+  if (finish === "asBefore" || finish === "quick" || roughPx < 3) return offs;
+  if (finish === "smoothest") for (let o = finishPx; o < roughPx; o += finishPx) offs.push(o);
+  else
+    for (const o of [Math.round(roughPx / 3), Math.round((2 * roughPx) / 3)])
+      if (o > 0 && o < roughPx && !offs.includes(o)) offs.push(o);
+  return offs;
+}
 
 /** A labelled stretch of the program, by index into the GRBL lines (comments removed). */
 export type CarveSection = { label: string; start: number };
@@ -72,6 +105,8 @@ export type ReliefPreview = {
   carved: Float32Array;
   /** 1 = inside the area that gets machined */
   work: Uint8Array;
+  /** The wood the detail pass meets (after roughing and clean-up), machine Z (mm). */
+  beforeDetail: Float32Array;
   res: number;
 };
 
@@ -142,6 +177,10 @@ function bitOffsets(bit: BitShape, res: number, depthRange: number): Offset[] {
 }
 
 const NO_LIMIT = -1e6;
+/** Feed for sideways moves below the clearance height (mm/min; GRBL caps it at $110/$111). */
+const TRAVEL_FEED = 1000;
+/** How far above the highest wood in reach the bit travels. */
+const TRAVEL_MARGIN = 0.5;
 
 /** Max (or min) over a (2k+1)² square window — two O(n) sliding passes. */
 function squareFilter(src: Float32Array, w: number, h: number, k: number, max: boolean): Float32Array {
@@ -277,6 +316,17 @@ class ProgramWriter {
     this.code(`G1 X${f3(x)} Y${f3(y)} Z${f3(z)}` + (f !== this.feed ? ` F${f}` : ""));
     this.feed = f;
   }
+  /**
+   * Sideways move at rapid speed while the bit is below the clearance height (only where it
+   * stays clear of the wood). Written as G1 so a "fast sideways move with the bit low" can only
+   * ever come from a move that was checked.
+   */
+  travel(x: number, y: number) {
+    this.rapidMm += Math.hypot(x - this.pos[0], y - this.pos[1]);
+    this.pos = [x, y, this.pos[2]];
+    this.code(`G1 X${f3(x)} Y${f3(y)} F${TRAVEL_FEED}`);
+    this.feed = TRAVEL_FEED;
+  }
   plunge(z: number) {
     this.cutMin += Math.abs(this.pos[2] - z) / this.P.feedPlunge;
     this.pos = [this.pos[0], this.pos[1], z];
@@ -355,6 +405,107 @@ export function generateCarve(input: ReliefInput): ReliefResult {
   const X = (i: number) => (i - cxPx) * R;
   const Y = (j: number) => (j - cyPx) * R;
 
+  // ---- where the wood is, for short, safe moves between cuts ----
+  /** Beyond this many pixels the bit's cone is higher than any wood can be. */
+  /**
+   * The bit's footprint for safe moves: like `offsets`, plus a ring one pixel wide around the
+   * edge. Wood between grid points just inside the edge would otherwise be missed, and at the
+   * edge of a deep cut that is the straight shank, where a tiny miss sideways is a big miss in
+   * height. Each ring pixel stands for wood up to half a pixel diagonal nearer the bit's axis.
+   */
+  const ring = R * Math.SQRT1_2;
+  const reach = offsets.reduce((a, o) => Math.max(a, Math.hypot(o.dx, o.dy) * R), 0);
+  const safeOffsets: { dx: number; dy: number; p: number }[] = [];
+  {
+    const kk = Math.ceil((reach + ring) / R);
+    for (let dy = -kk; dy <= kk; dy++)
+      for (let dx = -kk; dx <= kk; dx++) {
+        const r = Math.hypot(dx, dy) * R;
+        if (r > reach + ring + 1e-9) continue;
+        const p = r > reach - ring ? bitProfile(bit, Math.max(0, Math.min(reach, r) - ring)) : bitProfile(bit, r);
+        if (Number.isFinite(p)) safeOffsets.push({ dx, dy, p });
+      }
+    safeOffsets.sort((a, b) => a.p - b.p);
+  }
+  const kTravel = safeOffsets.reduce((a, o) => Math.max(a, Math.abs(o.dx), Math.abs(o.dy)), 0);
+  /**
+   * Highest the wood can be over each pixel (inside the carving or around it) when only `rows`
+   * have been cut, each to `cur`: the lowest cone of any cut point on the nearest cut row on
+   * either side, never above the board. A safe upper bound (cuts further away only lower it).
+   */
+  const coneTabs = new Map<number, Float32Array>(); // rows away -> cone height by columns away
+  const coneTab = (dRows: number) => {
+    let t = coneTabs.get(dRows);
+    if (!t) {
+      t = new Float32Array(kTravel + 1);
+      for (let di = 0; di <= kTravel; di++) {
+        // Near the edge of the bit's reach, the wood next to this pixel may be out of reach.
+        const d = Math.hypot(di, dRows) * R;
+        t[di] = d > reach - ring ? Infinity : bitProfile(bit, d);
+      }
+      coneTabs.set(dRows, t);
+    }
+    return t;
+  };
+  const woodAbove = (rows: number[]) => {
+    const out = new Float32Array(n);
+    const sorted = [...new Set(rows)].sort((a, b) => a - b);
+    let p = 0;
+    for (let j = 0; j < H; j++) {
+      while (p < sorted.length && sorted[p] < j) p++;
+      const near = [p > 0 ? sorted[p - 1] : -1, p < sorted.length ? sorted[p] : -1].filter((r) => r >= 0);
+      const tabs = near.map((r) => coneTab(Math.abs(j - r)));
+      for (let i = 0; i < W; i++) {
+        let top = 0;
+        near.forEach((r, q) => {
+          const tab = tabs[q];
+          if (tab[0] === Infinity) return; // too far away to have cut anything here
+          const base = r * W;
+          for (let di = -kTravel; di <= kTravel; di++) {
+            const ii = i + di;
+            if (ii < 0 || ii >= W || !work[base + ii]) continue;
+            const v = cur[base + ii] + tab[di < 0 ? -di : di];
+            if (v < top) top = v;
+          }
+        });
+        // 0.03 mm slack for the straight-line moves between planned points.
+        out[j * W + i] = Math.min(0, top + 0.03);
+      }
+    }
+    return out;
+  };
+  /**
+   * Lowest the tip can be at pixel (i, j) without any part of the bit touching `wood`. `cap` is
+   * a max-filtered copy of `wood` (an upper bound in reach), so the search can stop early.
+   */
+  const coneClear = (wood: Float32Array, cap: Float32Array, i: number, j: number) => {
+    const top = cap[j * W + i];
+    let best = -1e9;
+    for (const o of safeOffsets) {
+      if (top - o.p <= best) break;
+      const si = i + o.dx, sj = j + o.dy;
+      if (si < 0 || sj < 0 || si >= W || sj >= H) continue;
+      const v = wood[sj * W + si] - o.p;
+      if (v > best) best = v;
+    }
+    return best;
+  };
+  /** Lowest safe tip height over each pixel: the highest wood anywhere the bit could touch. */
+  const safeOver = (woodTop: Float32Array) => squareFilter(woodTop, W, H, kTravel, true);
+  /** Highest value of `map` along a straight move (mm). Outside the grid: the board top. */
+  const pathMax = (map: Float32Array, x0: number, y0: number, x1: number, y1: number) => {
+    const i0 = x0 / R + cxPx, j0 = y0 / R + cyPx, i1 = x1 / R + cxPx, j1 = y1 / R + cyPx;
+    const steps = Math.ceil(Math.max(Math.abs(i1 - i0), Math.abs(j1 - j0)) * 2) + 1;
+    let hi = -1e9;
+    for (let q = 0; q <= steps; q++) {
+      const f = q / steps;
+      const i = Math.round(i0 + (i1 - i0) * f), j = Math.round(j0 + (j1 - j0) * f);
+      const v = i < 0 || j < 0 || i >= W || j >= H ? 0 : map[j * W + i];
+      if (v > hi) hi = v;
+    }
+    return hi;
+  };
+
   const areaW = (wi1 - wi0) * R,
     areaD = (wj1 - wj0) * R;
   if (areaW > board.widthMm + 0.01 || areaD > board.depthMm + 0.01)
@@ -379,9 +530,32 @@ export function generateCarve(input: ReliefInput): ReliefResult {
   w.code("G4 P4");
 
   /** Cut one set of rows; `surfaceTop` = Z of wood still above each pixel (null = board top). */
-  const raster = (Z: Float32Array, rows: number[], feed: number, surfaceTop: Float32Array | null) => {
-    let flip = false;
-    for (const j of rows) {
+  /**
+   * `surfaceTop` decides where there is wood to cut (unchanged behaviour). Options:
+   *  - dropTop: highest the wood can be at a segment start; the fast drop stops `dropMargin`
+   *    (default 0.3 mm) above it (default: surfaceTop, or the board top).
+   *  - dropWood (with safe): highest the wood can be anywhere; the drop then also clears the
+   *    bit's whole cone over the wood beside the start, not just the wood under the tip.
+   *  - safe: lowest safe height for the bit's tip over each pixel. With it, the bit no longer
+   *    lifts above the board between segments; it lifts only to 0.5 mm above the wood in reach
+   *    along the way (never higher than the clearance height).
+   */
+  const raster = (
+    Z: Float32Array,
+    rows: number[],
+    feed: number,
+    surfaceTop: Float32Array | null,
+    opts: {
+      dropTop?: Float32Array;
+      safe?: Float32Array;
+      dropMargin?: number;
+      dropWood?: Float32Array;
+      bridgeMm?: number;
+    } = {},
+  ) => {
+    // Segments to cut, in order: back and forth, row by row. Each is a row and its pixels in
+    // cutting direction.
+    const rowSegs = (j: number) => {
       const segs: number[][] = [];
       let cur: number[] | null = null;
       for (let i = 0; i < W; i++) {
@@ -395,27 +569,72 @@ export function generateCarve(input: ReliefInput): ReliefResult {
           cur.push(i);
         } else cur = null;
       }
+      if (!opts.bridgeMm || segs.length < 2) return segs;
+      // Join two cuts on the same row across a short gap instead of lifting over it: the gap is
+      // inside the carving and already cut to (or below) this pass's depth there, so following
+      // it at that depth removes nothing and never goes below the allowed surface. Only across
+      // nearly level gaps: within 0.1 mm of a straight line between the two cuts and never more
+      // than 0.05 mm from one pixel to the next, so the straight moves between pixels can't clip
+      // a corner the separate cuts wouldn't have.
+      const maxGap = Math.round(opts.bridgeMm / R);
+      const out: number[][] = [segs[0]];
+      for (let q = 1; q < segs.length; q++) {
+        const a = out[out.length - 1], b = segs[q];
+        const i0 = a[a.length - 1] + 1, i1 = b[0] - 1;
+        let ok = i1 - i0 + 1 <= maxGap;
+        const za = Z[j * W + a[a.length - 1]], zb = Z[j * W + b[0]];
+        let prev = za;
+        for (let i = i0; ok && i <= i1 + 1; i++) {
+          const k = j * W + i;
+          const line = za + ((zb - za) * (i - i0 + 1)) / (i1 - i0 + 2);
+          if ((i <= i1 && !work[k]) || Math.abs(Z[k] - line) > 0.1 || Math.abs(Z[k] - prev) > 0.05) ok = false;
+          prev = Z[k];
+        }
+        if (ok) for (let i = i0; i <= b[b.length - 1]; i++) a.push(i);
+        else out.push(b);
+      }
+      return out;
+    };
+    const order: { j: number; s: number[] }[] = [];
+    let flip = false;
+    for (const j of rows) {
+      const segs = rowSegs(j);
       if (!segs.length) continue;
       if (flip) {
         segs.reverse();
-        for (const s of segs) s.reverse();
+        for (const sg of segs) sg.reverse();
       }
       flip = !flip;
-      for (const s of segs) {
-        const pts = compress(s.map((i) => [X(i), Y(j), Z[j * W + i]] as [number, number, number]));
-        if (w.pos[2] < P.clearZ) w.g0(undefined, undefined, P.clearZ);
-        // Restart point: from here the segment needs nothing but a spinning bit.
-        w.restartHere();
-        w.forgetFeed();
-        w.g0(pts[0][0], pts[0][1]);
-        const startTop = surfaceTop ? surfaceTop[j * W + s[0]] : 0;
-        w.g0(undefined, undefined, Math.min(P.clearZ, startTop + 0.3));
-        w.plunge(pts[0][2]);
-        for (let a = 1; a < pts.length; a++) w.g1(pts[a][0], pts[a][1], pts[a][2], feed);
-        w.g0(undefined, undefined, P.clearZ);
+      for (const sg of segs) order.push({ j, s: sg });
+    }
+    for (const { j, s } of order) {
+      const pts = compress(s.map((i) => [X(i), Y(j), Z[j * W + i]] as [number, number, number]));
+      let travelZ = P.clearZ;
+      if (opts.safe) {
+        const hi = pathMax(opts.safe, w.pos[0], w.pos[1], pts[0][0], pts[0][1]) + TRAVEL_MARGIN;
+        // Near the board top, use the normal clearance height.
+        if (hi < 0) travelZ = hi;
       }
+      if (w.pos[2] < travelZ) w.g0(undefined, undefined, travelZ);
+      // Restart point: from here the segment needs nothing but a spinning bit.
+      w.restartHere();
+      w.forgetFeed();
+      if (w.pos[2] >= P.clearZ - 1e-6) w.g0(pts[0][0], pts[0][1]);
+      else w.travel(pts[0][0], pts[0][1]);
+      const dropTop = opts.dropTop ?? surfaceTop;
+      let startTop = dropTop ? dropTop[j * W + s[0]] : 0;
+      if (opts.dropWood && opts.safe) startTop = Math.max(startTop, coneClear(opts.dropWood, opts.safe, s[0], j));
+      const dropZ = Math.min(P.clearZ, startTop + (opts.dropMargin ?? 0.3));
+      if (dropZ < w.pos[2]) w.g0(undefined, undefined, dropZ);
+      w.plunge(pts[0][2]);
+      for (let a = 1; a < pts.length; a++) w.g1(pts[a][0], pts[a][1], pts[a][2], feed);
+      if (!opts.safe) w.g0(undefined, undefined, P.clearZ);
     }
   };
+
+  const finish: FinishMode = P.finish ?? "asBefore";
+  const asBefore = finish === "asBefore";
+  const finishPx = finishRowPx(finish, P.finishStepMm, R);
 
   // Roughing: layer by layer over the whole piece.
   const roughPx = Math.max(1, Math.round(P.roughStepMm / R));
@@ -434,7 +653,11 @@ export function generateCarve(input: ReliefInput): ReliefResult {
     progress(0.25 + (0.35 * li) / layers.length, `Planning roughing layer ${li + 1} of ${layers.length}`);
     w.section(`Roughing - layer ${li + 1} of ${layers.length}`);
     for (let k = 0; k < n; k++) Zl[k] = Math.max(Zr[k], level);
-    raster(Zl, roughRows, P.feedRough, cur);
+    if (asBefore) raster(Zl, roughRows, P.feedRough, cur);
+    else {
+      const wood = woodAbove(li > 0 ? roughRows : []);
+      raster(Zl, roughRows, P.feedRough, cur, { safe: safeOver(wood), dropWood: wood, bridgeMm: 5 });
+    }
     for (let k = 0; k < n; k++) if (work[k] && Zl[k] < cur[k]) cur[k] = Zl[k];
   });
 
@@ -442,12 +665,13 @@ export function generateCarve(input: ReliefInput): ReliefResult {
   // of wood is left standing between each pair of grooves, up to ~1.3 mm above the finished
   // surface instead of the planned skin. The detail pass then has to shave each fin away from one
   // side; in hardwood the last sliver bends or tears instead of cutting, and the bit takes bites
-  // several times bigger than planned. That leaves lines along the rows. One more row at the
-  // roughing depth, centred between each pair of roughing rows, splits every fin evenly from both
-  // sides (no thin sliver is ever left leaning) and halves what the detail pass has to remove.
-  if (bit.type === "vee" && roughPx >= 3) {
+  // several times bigger than planned. That leaves lines along the rows. Clean-up rows at the
+  // roughing depth between the roughing rows cut the fins down first: two rows (standard) leave
+  // fins about a quarter as tall; rows all the way across (smoothest) leave an even skin.
+  const cutRows = [...roughRows];
+  if (!asBefore && bit.type === "vee" && roughPx >= 3) {
     const t = Math.tan((bit.halfAngleDeg * Math.PI) / 180);
-    const offs = [Math.round(roughPx / 2)];
+    const offs = cleanupOffsets(finish, roughPx, finishPx);
     const cleanRows: { j: number; below: number; above: number }[] = [];
     for (const j0 of roughRows)
       offs.forEach((o, idx) => {
@@ -473,12 +697,21 @@ export function generateCarve(input: ReliefInput): ReliefResult {
       }
     progress(0.6, "Planning the fin clean-up");
     w.section("Roughing - fin clean-up");
-    raster(Zr, cleanRows.map((r) => r.j), P.feedRough, woodTop);
+    const roughWood = woodAbove(roughRows);
+    raster(Zr, cleanRows.map((r) => r.j), P.feedRough, woodTop, {
+      safe: safeOver(roughWood),
+      dropWood: roughWood,
+      dropMargin: 0.5,
+      bridgeMm: 3,
+    });
+    for (const r of cleanRows) cutRows.push(r.j);
   }
+  // Before the detail pass: the wood left by roughing and clean-up, for short drops and moves.
+  const detailWood = asBefore ? new Float32Array(0) : woodAbove(cutRows);
+  const detailSafe = asBefore ? detailWood : safeOver(detailWood);
 
   // Detail pass, in three parts so progress reads naturally.
   progress(0.62, "Planning the detail pass");
-  const finishPx = Math.max(1, Math.round(P.finishStepMm / R));
   const finishRows: number[] = [];
   for (let j = Math.ceil(wj0 / finishPx) * finishPx; j <= wj1; j += finishPx) finishRows.push(j);
   const parts = 3;
@@ -486,7 +719,13 @@ export function generateCarve(input: ReliefInput): ReliefResult {
     w.section(`Detail pass - part ${p + 1} of ${parts}`);
     const a = Math.floor((finishRows.length * p) / parts),
       b = Math.floor((finishRows.length * (p + 1)) / parts);
-    raster(Zf, finishRows.slice(a, b), P.feedFinish, null);
+    raster(
+      Zf,
+      finishRows.slice(a, b),
+      P.feedFinish,
+      null,
+      asBefore ? {} : { dropTop: detailWood, safe: detailSafe, dropWood: detailWood, dropMargin: 0.5 },
+    );
   }
   w.g0(undefined, undefined, P.safeZ);
   w.code("M5");
@@ -558,6 +797,10 @@ export function generateCarve(input: ReliefInput): ReliefResult {
   if (maxGouge > 0.1)
     problems.push(`Simulation shows the bit cutting ${maxGouge.toFixed(2)} mm into the design.`);
 
+  // For the picture of what the detail bit meets (doesn't change the program).
+  const beforeDetail = asBefore ? woodAbove(roughRows) : detailWood;
+  for (let k = 0; k < n; k++) if (!work[k]) beforeDetail[k] = 0;
+
   const target = new Float32Array(n);
   for (let k = 0; k < n; k++) target[k] = work[k] ? T[k] : 0;
 
@@ -572,7 +815,7 @@ export function generateCarve(input: ReliefInput): ReliefResult {
       estMinutes: totalMin,
       sectionMinutes,
     },
-    preview: { width: W, height: H, target, carved, work, res: R },
+    preview: { width: W, height: H, target, carved, work, res: R, beforeDetail },
     summary: {
       designWidthMm: (mi1 - mi0) * R,
       designDepthMm: (mj1 - mj0) * R,

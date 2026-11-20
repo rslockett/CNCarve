@@ -30,6 +30,7 @@ import {
   rememberOriginal,
   settingCommands,
   FAST_SETTINGS,
+  SPEED_KEYS,
   testPattern,
   type SpeedSettings,
   type SpeedTarget,
@@ -444,6 +445,7 @@ export class CarveMachine {
       this.say("warn", "Home the machine and set zero first.");
       return;
     }
+    if (!(await this.applySpeed(c.speed))) return;
     let g54 = null;
     try {
       g54 = await this.serial.readG54();
@@ -504,6 +506,7 @@ export class CarveMachine {
       const p = loadProgress(c.id);
       // A deliberate pause saved the exact segment to resume from; otherwise back up safely.
       const from = restartLineFor(c, p);
+      if (!(await this.applySpeed(c.speed))) throw new Error("the speed settings could not be set");
       // After homing the bit is at the top; the restart segment moves over, then down.
       const preamble = ["G21 G90 G17 G94", "G54", `M3 S${c.spindleS}`, "G4 P4"];
       for (const cmd of preamble) await this.serial.sendCommand(cmd, 30_000);
@@ -800,6 +803,26 @@ export class CarveMachine {
       if (!quiet) this.say("good", "Your original speed settings are back.");
     } catch (e) {
       this.say("bad", `Couldn't restore the original settings (${short(e)}).`);
+    }
+  }
+
+  /**
+   * Put the carve's speed settings on the machine if they differ (only while it stands still).
+   * Returns false (with a message) if they couldn't be set.
+   */
+  private async applySpeed(speed: SpeedSettings | undefined): Promise<boolean> {
+    if (!speed) return true;
+    const g = this.state.grbl;
+    if (g && SPEED_KEYS.every((k) => Math.abs(g[k] - speed[k]) < 1e-6)) return true;
+    try {
+      for (const cmd of originalCommands(speed)) await this.serial.sendCommand(cmd);
+      await this.checkSettings();
+      const now = this.state.grbl;
+      if (now && !SPEED_KEYS.every((k) => Math.abs(now[k] - speed[k]) < 1e-6)) throw new Error("the machine kept other values");
+      return true;
+    } catch (e) {
+      this.say("bad", `Couldn't set the speed settings for this carve (${short(e)}). Nothing was cut.`);
+      return false;
     }
   }
 

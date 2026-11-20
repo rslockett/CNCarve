@@ -29,6 +29,22 @@ crosses, plaques) on a 3018-PROVer.
   drop, stop, page reload or Pi reboot, **Continue carving** homes, checks the zero (restoring it
   if it changed), turns the spindle on above the work and restarts at a safe segment start a
   little before where it stopped.
+- **Finish and speed (step 4):** each option shows a small picture of the wood left for the detail
+  pass and its time at both speeds.
+  - **Quick:** no clean-up; the detail pass meets the roughing fins, so lines are likely.
+  - **Standard** (recommended): two clean-up rows between roughing rows cut the thin fins that
+    roughing leaves, so the detail pass doesn't tear them.
+  - **Smoothest:** clean-up all the way across, leaving an even 0.2 mm skin. Best for faces and
+    fine detail.
+  - **Use the original program instead** (link under the cards): exactly the program the engine
+    made before the clean-up existed.
+  - **Speed:** Fast (30 mm/s² on all motors) or Original (the machine's own settings from before
+    the speed check). It is put on the machine when the carve starts and again on Continue.
+
+  Standard and Smoothest also skip wasted moves: the bit lifts only as high as the nearby wood
+  needs, and drops quickly to just above the roughed wood before its slow plunge.
+  `web/scripts/check-carve.ts` proves a design's program is safe: roughing and detail cuts
+  match the original program, and every fast move checked against a 3D simulation of the wood.
 
 The original Kiri:Moto workspace is at **`/advanced`**. Engine code: `web/src/lib/relief/`;
 machine control: `web/src/lib/carveMachine.ts`, `web/src/lib/carveStore.ts`; screen:

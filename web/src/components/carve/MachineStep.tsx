@@ -7,7 +7,7 @@ import { JogPad } from "./JogPad";
 import { LiveCarveView } from "./LiveCarveView";
 import { SpeedCheck } from "./SpeedCheck";
 import { loadFactor } from "@/lib/carveTime";
-import { FAST_SETTINGS, loadOriginal, speedProfileOf } from "@/lib/speedCheck";
+import type { SpeedSettings } from "@/lib/speedCheck";
 import { useCallback, useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
 
 type Props = {
@@ -21,6 +21,7 @@ type Props = {
         bit: BitShape;
         area: { minX: number; maxX: number; minY: number; maxY: number };
         timeline: number[];
+        speed?: SpeedSettings | null;
       })
     | null;
 };
@@ -251,7 +252,6 @@ export function MachineStep({ machine, job }: Props) {
                 : settingsProblems.length === 0
                   ? "Machine settings look right."
                   : null}
-              {s.grbl && <SpeedChoice machine={machine} s={s} />}
               {settingsProblems.map((it) => (
                 <p key={it.id} className={it.status === "problem" ? "text-rose-300" : "text-amber-200"}>
                   {it.status === "problem" ? "✕" : "!"} {it.title}. {it.detail}{" "}
@@ -394,6 +394,7 @@ export function MachineStep({ machine, job }: Props) {
                         bit: job.bit,
                         area: job.area,
                         timeline: job.timeline,
+                        speed: job.speed ?? undefined,
                       })
                     }
                   >
@@ -480,39 +481,3 @@ function Row({ n, done, title, children }: { n: number; done: boolean; title: st
   );
 }
 
-/** Fast / Original: the two known speed setups, one tap each. */
-function SpeedChoice({ machine, s }: { machine: CarveMachine; s: MachineState }) {
-  const hasOriginal = useSyncExternalStore(noopSubscribe, () => !!loadOriginal(), () => false);
-  const now = s.grbl ? speedProfileOf(s.grbl) : "other";
-  const o = hasOriginal ? loadOriginal() : null;
-  const btn = (active: boolean) =>
-    `rounded-lg px-2.5 py-1 text-xs font-medium disabled:opacity-40 ${active ? "bg-teal-600 text-white" : "border border-white/15 text-slate-300 hover:bg-white/5"}`;
-  return (
-    <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-      <span>Speed:</span>
-      <button
-        type="button"
-        className={btn(now === "fast")}
-        disabled={s.busy !== null || now === "fast"}
-        onClick={() => void machine.useSpeed("fast")}
-        title={`${FAST_SETTINGS[120]} mm/s² on all motors, corner ${FAST_SETTINGS[11]}`}
-      >
-        Fast{now === "fast" ? " ✓" : ""}
-      </button>
-      <button
-        type="button"
-        className={btn(now === "original")}
-        disabled={s.busy !== null || now === "original" || !hasOriginal}
-        onClick={() => void machine.useSpeed("original")}
-        title={o ? `${o[120]} mm/s², corner ${o[11]} — your machine's own settings` : "Not remembered on this device"}
-      >
-        Original{now === "original" ? " ✓" : ""}
-      </button>
-      {now === "other" && s.grbl && (
-        <span className="text-slate-500">
-          (now {Math.min(s.grbl[120], s.grbl[121])} mm/s², up-and-down {s.grbl[122]})
-        </span>
-      )}
-    </div>
-  );
-}

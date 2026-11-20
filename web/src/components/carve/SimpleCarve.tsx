@@ -13,7 +13,9 @@ import {
   type Board,
   type Oriented,
 } from "@/lib/relief/fit";
-import type { BitShape } from "@/lib/relief/reliefCam";
+import type { BitShape, FinishMode } from "@/lib/relief/reliefCam";
+import { FAST_SETTINGS, loadOriginal, motionWithSpeed, type SpeedSettings } from "@/lib/speedCheck";
+import { FINISHES, FinishPreview, finishTitle, type SpeedChoice } from "./FinishChoice";
 import type { ReliefWorkerMessage, ReliefWorkerRequest, TimedResult } from "@/lib/relief/relief.worker";
 import { deriveReliefSettings } from "@/lib/relief/settings";
 import { PROVER_PRESET } from "@/lib/presets/prover";
@@ -23,18 +25,20 @@ import { loadFactor, loadMotion } from "@/lib/carveTime";
 import { PROVER_MOTION } from "@/lib/relief/motionTime";
 import { MachineBar } from "./MachineBar";
 import { MachineStep } from "./MachineStep";
-import { ReliefPreview } from "./ReliefPreview";
+import { PUSH_OFF, ReliefPreview } from "./ReliefPreview";
 
 type Units = "in" | "mm";
 const MM = 25.4;
 const PREFS_KEY = "cncarve:simplePrefs";
 
-type Prefs = { units: Units; board: Board; wood: string; toolId: number };
+type Prefs = { units: Units; board: Board; wood: string; toolId: number; finish: FinishMode; speed: SpeedChoice };
 const DEFAULT_PREFS: Prefs = {
   units: "in",
   board: { widthMm: 4 * MM, lengthMm: 6 * MM, thicknessMm: 0.75 * MM },
   wood: "hardwood",
   toolId: PROVER_PRESET.defaultDetailToolId,
+  finish: "standard",
+  speed: "fast",
 };
 
 const WOODS = [
@@ -89,7 +93,16 @@ export function SimpleCarve() {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setStored(loadMotion());
   }, [machineMotion]);
-  const motion = machineMotion ?? stored.motion;
+  const baseMotion = machineMotion ?? stored.motion;
+  // The machine's original speed settings (from before the first speed check), if remembered.
+  const original = useSyncExternalStore(noopSubscribe, () => JSON.stringify(loadOriginal()), () => "null");
+  const originalSpeed = useMemo(() => JSON.parse(original) as SpeedSettings | null, [original]);
+  const speedSettings: Record<SpeedChoice, SpeedSettings | null> = { fast: FAST_SETTINGS, original: originalSpeed };
+  const speed: SpeedChoice = prefs.speed === "original" && !originalSpeed ? "fast" : prefs.speed;
+  const motionFor = (sp: SpeedChoice) => {
+    const st = speedSettings[sp];
+    return st ? motionWithSpeed(baseMotion, st) : baseMotion;
+  };
   const motionKnown = !!machineMotion || stored.fromMachine;
   // What real carves on this machine took compared with the prediction (1 = no correction yet).
   const learned = useSyncExternalStore(noopSubscribe, () => loadFactor()?.factor ?? 0, () => 0);
@@ -126,15 +139,18 @@ export function SimpleCarve() {
         ? deriveReliefSettings(
             { machineId: PROVER_PRESET.id, toolId: prefs.toolId, materialId: prefs.wood, qualityId: "balanced" },
             sized,
+            prefs.finish,
           )
         : null,
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [sized?.x, sized?.y, prefs.toolId, prefs.wood],
+    [sized?.x, sized?.y, prefs.toolId, prefs.wood, prefs.finish],
   );
 
-  const key = design && sized && settings
-    ? [design.name, design.turned, sized.x.toFixed(2), sized.y.toFixed(2), JSON.stringify(prefs.board), JSON.stringify(settings.params), JSON.stringify(settings.bit), JSON.stringify(motion)].join("|")
+  // Everything that changes the program, except the finish (so other finishes can be compared).
+  const baseKey = design && sized && settings
+    ? [design.name, design.turned, sized.x.toFixed(2), sized.y.toFixed(2), JSON.stringify(prefs.board), JSON.stringify({ ...settings.params, finish: undefined, resMm: undefined }), JSON.stringify(settings.bit), JSON.stringify(baseMotion), original].join("|")
     : null;
+  const key = baseKey ? `${baseKey}|${prefs.finish}` : null;
 
   // Make toolpaths automatically once everything fits (short pause so typing doesn't restart it).
   useEffect(() => {
@@ -151,7 +167,7 @@ export function SimpleCarve() {
         else if (m.type === "error") {
           setTp({ kind: "error", message: m.message });
           w.terminate();
-        } else {
+        } else if (m.type === "done") {
           setTp({
             kind: "done",
             key,
@@ -170,7 +186,9 @@ export function SimpleCarve() {
         params: settings.params,
         board: { widthMm: prefs.board.widthMm, depthMm: prefs.board.lengthMm, thicknessMm: prefs.board.thicknessMm },
         name: design.name,
-        motion,
+        // Times for Fast; Original is worked out alongside, so switching speed needs no remake.
+        motion: motionFor("fast"),
+        extraMotions: [motionFor("fast"), motionFor("original")],
       };
       w.postMessage(req, [req.vertices.buffer]);
     }, 700);
@@ -180,14 +198,70 @@ export function SimpleCarve() {
   useEffect(() => () => workerRef.current?.terminate(), []);
 
   const current = tp.kind === "done" && tp.key === key ? tp : null;
+
+  // Times for the other finishes (Fast, Original), worked out one after another once the chosen
+  // one is ready. Keyed by everything but the finish.
+  const [estimates, setEstimates] = useState<Record<string, [number, number]>>({});
+  const estRef = useRef<Worker | null>(null);
+  useEffect(() => {
+    if (!current || !baseKey || !oriented || !settings || !design || !sized) return;
+    const next = FINISHES.find((f) => f.id !== prefs.finish && !estimates[`${baseKey}|${f.id}`]);
+    if (!next) return;
+    const w = new Worker(new URL("../../lib/relief/relief.worker.ts", import.meta.url), { type: "module" });
+    estRef.current = w;
+    w.onmessage = (ev: MessageEvent<ReliefWorkerMessage>) => {
+      const m = ev.data;
+      if (m.type === "estimate") {
+        setEstimates((e) => ({ ...e, [`${baseKey}|${next.id}`]: [m.minutes[1], m.minutes[2]] }));
+        w.terminate();
+      } else if (m.type === "error") w.terminate();
+    };
+    const req: ReliefWorkerRequest = {
+      vertices: scaleVertices(oriented.vertices, scale, scale, scale),
+      bit: settings.bit,
+      // Each finish with its own settings (its grid can differ), exactly as if it were chosen.
+      params: deriveReliefSettings(
+        { machineId: PROVER_PRESET.id, toolId: prefs.toolId, materialId: prefs.wood, qualityId: "balanced" },
+        sized ?? { x: 0, y: 0 },
+        next.id,
+      ).params,
+      board: { widthMm: prefs.board.widthMm, depthMm: prefs.board.lengthMm, thicknessMm: prefs.board.thicknessMm },
+      name: design.name,
+      motion: motionFor("fast"),
+      extraMotions: [motionFor("fast"), motionFor("original")],
+      estimateOnly: true,
+    };
+    w.postMessage(req, [req.vertices.buffer]);
+    return () => w.terminate();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [current, baseKey, estimates]);
+  useEffect(() => () => estRef.current?.terminate(), []);
+  const estimateFor = (f: FinishMode): [number, number] | undefined =>
+    f === prefs.finish && current
+      ? [current.result.extraMinutes[0], current.result.extraMinutes[1]]
+      : baseKey
+        ? estimates[`${baseKey}|${f}`]
+        : undefined;
+
+  // The program's times were worked out for Fast; Original scales them.
+  const speedRatio = current
+    ? (() => {
+        const [f, o] = current.result.extraMinutes;
+        return speed === "original" && f > 0 ? o / f : 1;
+      })()
+    : 1;
   const job = current
     ? {
         ...current.result.program,
+        estMinutes: current.result.program.estMinutes * speedRatio,
+        sectionMinutes: current.result.program.sectionMinutes.map((m) => m * speedRatio),
+        timeline: current.result.program.timeline.map((t) => t * speedRatio),
+        speed: speedSettings[speed],
+        speedName: speed,
         name: design?.name ?? "carving",
         bitLabel: current.bitLabel,
         spindleS: current.spindleS,
         bit: current.bit,
-        timeline: current.result.program.timeline,
         area: {
           minX: current.result.summary.workMinX,
           maxX: current.result.summary.workMaxX,
@@ -385,6 +459,89 @@ export function SimpleCarve() {
                 ))}
               </select>
             </div>
+            <div className="space-y-2">
+              <p className="text-sm font-medium text-white">Finish</p>
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                {FINISHES.map((f) => {
+                  const est = estimateFor(f.id);
+                  const sel = prefs.finish === f.id;
+                  return (
+                    <button
+                      key={f.id}
+                      type="button"
+                      onClick={() => setPrefs((p) => ({ ...p, finish: f.id }))}
+                      className={`rounded-xl border p-2 text-left ${sel ? "border-teal-500 bg-teal-950/50" : "border-white/10 bg-slate-900/60 hover:border-white/25"}`}
+                    >
+                      <p className="text-sm font-medium text-white">
+                        {f.title}
+                        {f.id === "standard" && <span className="ml-1.5 text-[10px] font-normal text-teal-300">recommended</span>}
+                      </p>
+                      <p className="mb-1.5 text-[11px] text-slate-400">{f.detail}</p>
+                      {settings && <FinishPreview mode={f.id} bit={settings.bit} params={settings.params} />}
+                      <p className="mt-1 text-[11px] text-slate-200">
+                        {est ? (
+                          <>
+                            Fast: {minutesText(est[0] * factor)}
+                            {originalSpeed && <> · Original: {minutesText(est[1] * factor)}</>}
+                          </>
+                        ) : sized && fits ? (
+                          <span className="text-slate-500">Working out the time…</span>
+                        ) : null}
+                      </p>
+                    </button>
+                  );
+                })}
+              </div>
+              {prefs.finish === "asBefore" ? (
+                <p className="rounded-lg border border-amber-500/40 bg-amber-950/30 p-2 text-[11px] text-amber-100">
+                  Using the original program: exactly what the app made before the clean-up and the shorter
+                  moves were added (no clean-up, slower).{" "}
+                  <button type="button" className="underline" onClick={() => setPrefs((p) => ({ ...p, finish: "standard" }))}>
+                    Back to Standard
+                  </button>
+                </p>
+              ) : (
+                <button
+                  type="button"
+                  className="text-[11px] text-slate-500 underline hover:text-slate-300"
+                  onClick={() => setPrefs((p) => ({ ...p, finish: "asBefore" }))}
+                >
+                  Use the original program instead
+                </button>
+              )}
+              <div className="flex flex-wrap items-center gap-2 pt-1">
+                <span className="text-sm font-medium text-white">Speed</span>
+                {(["fast", "original"] as const).map((sp) => (
+                  <button
+                    key={sp}
+                    type="button"
+                    disabled={sp === "original" && !originalSpeed}
+                    onClick={() => setPrefs((p) => ({ ...p, speed: sp }))}
+                    title={
+                      sp === "fast"
+                        ? "30 mm/s² on all motors, corner setting 0.02 (what the speed check set)"
+                        : originalSpeed
+                          ? `${originalSpeed[120]} mm/s², corner setting ${originalSpeed[11]}: your machine's own settings`
+                          : "This device doesn't remember your original settings"
+                    }
+                    className={`rounded-lg border px-3 py-1.5 text-xs font-medium disabled:opacity-40 ${speed === sp ? "border-teal-500 bg-teal-950/50 text-white" : "border-white/15 text-slate-300 hover:bg-white/5"}`}
+                  >
+                    {sp === "fast" ? "Fast" : "Original"}
+                  </button>
+                ))}
+              </div>
+              {!originalSpeed && (
+                <p className="text-[11px] text-amber-200/80">
+                  Original isn&apos;t available on this device: your machine&apos;s own settings are remembered by the
+                  computer that ran the speed check (your Pi).
+                </p>
+              )}
+              <p className="text-[11px] text-slate-500">
+                The speed is put on the machine when the carve starts, and again if it has to continue after a stop.
+                Fast is 30 mm/s² on all motors; Original is your machine&apos;s own settings from before the speed check.
+                The original program with Original speed carves the same way as your first cross.
+              </p>
+            </div>
             {tp.kind === "running" && (
               <div>
                 <div className="h-2 overflow-hidden rounded-full bg-slate-800">
@@ -398,9 +555,37 @@ export function SimpleCarve() {
               <div className="space-y-3">
                 <div className="grid grid-cols-2 gap-3">
                   <ReliefPreview preview={current.result.preview} which="target" label="Your design" />
-                  <ReliefPreview preview={current.result.preview} which="carved" label="What your bit will carve" />
+                  <ReliefPreview
+                    preview={current.result.preview}
+                    which="likely"
+                    pushOff={PUSH_OFF[speed]}
+                    label="What your bit will carve (estimate)"
+                  />
                 </div>
-                {current.result.program.estMinutes * factor > 240 && (
+                <div className="grid grid-cols-2 gap-3">
+                  <ReliefPreview
+                    preview={current.result.preview}
+                    which="beforeDetail"
+                    zoomMm={12}
+                    label={`Close-up before the detail pass (${finishTitle(prefs.finish)})`}
+                  />
+                  <ReliefPreview
+                    preview={current.result.preview}
+                    which="likely"
+                    pushOff={PUSH_OFF[speed]}
+                    zoomMm={12}
+                    label="Same spot after the detail pass (estimate)"
+                  />
+                </div>
+                <p className="text-xs text-slate-400">
+                  The most detailed {fmt(12)} of your design. Left: after roughing{prefs.finish === "asBefore" || prefs.finish === "quick" ? "" : " and clean-up"},
+                  just before the detail pass. The lines are fins of wood left between roughing rows: the taller they are,
+                  the harder the detail bit has to work and the more likely it is to tear or leave ridges. Right: the
+                  same spot finished, estimated for a real 3018: where the bit meets more wood than planned it is
+                  pushed off a little and cuts slightly shallow, which shows as lines. The estimate follows your own
+                  carvings: clear lines with tall fins at Fast, a clean result at Original.
+                </p>
+                {current.result.program.estMinutes * speedRatio * factor > 240 && (
                   <p className="text-xs text-amber-200">
                     That&apos;s a long carve. Carving time grows with the area, so a slightly smaller size is much
                     faster — change the height in step 3.
@@ -408,7 +593,7 @@ export function SimpleCarve() {
                 )}
                 {current.result.summary.problems.length === 0 ? (
                   <p className="rounded-xl border border-emerald-500/30 bg-emerald-950/30 p-3 text-sm text-emerald-100">
-                    ✓ Ready: about {minutesText(current.result.program.estMinutes * factor)} of carving in one go,
+                    ✓ Ready: about {minutesText(current.result.program.estMinutes * speedRatio * factor)} of carving in one go,
                     with a {current.bitLabel}. Checked for the machine, and the bit never cuts into the design.
                     <span className="mt-1 block text-xs text-emerald-200/70">
                       {!motionKnown
